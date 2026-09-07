@@ -52,6 +52,8 @@ class DashboardService:
             },
             "charts": {
                 "total_charts": chart_stats.get("total_charts"),
+                "total_charts_excluding_deleted": chart_stats.get("total_charts_excluding_deleted", 0),
+                "deleted_charts": chart_stats.get("deleted_charts", 0),
                 "unique_songs": chart_stats.get("unique_songs"),
                 "unique_creators": chart_stats.get("unique_creators"),
                 "status_distribution": chart_stats.get("status_distribution"),

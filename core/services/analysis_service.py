@@ -263,25 +263,44 @@ class AnalysisService:
 
                 where_clause, params = mode_selector.build_chart_sql_where("c")
 
-                # 总谱面数
-                cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
-                total_charts = cursor.fetchone()[0] or 0
+                # 总谱面数（含已删除）与排除已删除后的数量
+                cursor.execute(
+                    f"SELECT COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause}",
+                    params,
+                )
+                _row = cursor.fetchone()
+                total_charts = _row[0] or 0
+                total_charts_excl = _row[1] or 0
 
-                # 创作者数
-                cursor.execute(f"SELECT COUNT(DISTINCT c.creator_name) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL", params)
+                # 创作者数（排除已删除）
+                cursor.execute(
+                    f"SELECT COUNT(DISTINCT CASE WHEN c.server_exists = 1 THEN c.creator_name END) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL",
+                    params,
+                )
                 unique_creators = cursor.fetchone()[0] or 0
 
-                # 平均热度
-                cursor.execute(f"SELECT AVG(c.heat) FROM charts c WHERE {where_clause} AND c.heat > 0", params)
+                # 平均热度（排除已删除）
+                cursor.execute(
+                    f"SELECT AVG(CASE WHEN c.server_exists = 1 THEN c.heat END) FROM charts c WHERE {where_clause} AND c.heat > 0",
+                    params,
+                )
                 avg_heat = cursor.fetchone()[0] or 0
 
-                # 平均难度
-                cursor.execute(f"SELECT AVG(CAST(c.level AS REAL)) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0", params)
+                # 平均难度（排除已删除）
+                cursor.execute(
+                    f"SELECT AVG(CASE WHEN c.server_exists = 1 THEN CAST(c.level AS REAL) END) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0",
+                    params,
+                )
                 avg_level = cursor.fetchone()[0] or 0
 
-                # Stable谱面数
-                cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.status = 2", params)
-                stable_charts = cursor.fetchone()[0] or 0
+                # Stable谱面数（含已删除与排除已删除）
+                cursor.execute(
+                    f"SELECT COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause} AND c.status = 2",
+                    params,
+                )
+                _row = cursor.fetchone()
+                stable_charts = _row[0] or 0
+                stable_charts_excl = _row[1] or 0
 
                 mode_names = {0: "Key", 1: "Step", 2: "DJ", 3: "Catch", 4: "Pad",
                             5: "Taiko", 6: "Ring", 7: "Slide", 8: "Live", 9: "Cube"}
@@ -290,11 +309,13 @@ class AnalysisService:
                     "mode": mode,
                     "mode_name": mode_names.get(mode, "未知"),
                     "total_charts": total_charts,
+                    "total_charts_excluding_deleted": total_charts_excl,
                     "unique_creators": unique_creators,
                     "avg_heat": float(avg_heat),
                     "avg_level": float(avg_level),
                     "stable_charts": stable_charts,
-                    "stability_rate": (stable_charts / total_charts * 100) if total_charts > 0 else 0
+                    "stable_charts_excluding_deleted": stable_charts_excl,
+                    "stability_rate": (stable_charts_excl / total_charts_excl * 100) if total_charts_excl > 0 else 0
                 })
 
             # 按总谱面数排序

@@ -1,6 +1,8 @@
 ﻿import copy
 from datetime import datetime, timedelta
 
+from selector import format_dual_count
+
 
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
@@ -162,7 +164,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         cursor.execute(
             f"""
             SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-                c.creator_name, c.heat, c.donate_count, c.last_updated
+                c.creator_name, c.heat, c.donate_count, c.last_updated, c.server_exists
             FROM charts c
             JOIN songs s ON c.sid = s.sid
             WHERE {where_clause}
@@ -175,8 +177,11 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             print(colorize(f"\n找到 {len(results)} 个匹配谱面", Colors.CYAN))
             print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             print(get_separator())
-            for cid, version, level, status, title, artist, creator, heat, donate, updated in results:
+            print(colorize("(* 前缀表示已从服务器删除的谱面)", Colors.YELLOW))
+            for cid, version, level, status, title, artist, creator, heat, donate, updated, server_exists in results:
                 status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
+                if not server_exists:
+                    title = "*" + title
                 print(f"  {title} - {artist} (Lv.{level})")
                 print(f"    版本: {version}, 状态: {status_name}, 热度: {heat}")
                 print(f"    创作者: {creator}, CID: {cid}")
@@ -191,7 +196,9 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         cursor.execute(
             f"""
             SELECT c.creator_name, COUNT(*) as chart_count,
-                AVG(c.heat) as avg_heat, MAX(c.heat) as max_heat
+                SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) as chart_count_excl,
+                AVG(CASE WHEN c.server_exists = 1 THEN c.heat END) as avg_heat,
+                MAX(c.heat) as max_heat
             FROM charts c
             WHERE {where_clause}
             GROUP BY c.creator_name
@@ -204,8 +211,8 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             print(colorize(f"\n找到 {len(results)} 个匹配创作者", Colors.CYAN))
             print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
             print(get_separator())
-            for creator, count, avg_heat, max_heat in results:
-                print(f"  {creator}: {count} 个谱面")
+            for creator, count, count_excl, avg_heat, max_heat in results:
+                print(f"  {creator}: {format_dual_count(count_excl, count)} 个谱面")
                 print(f"    平均热度: {avg_heat:.1f}, 最高热度: {max_heat}")
         else:
             print(colorize(f"未找到包含 '{keyword}' 的创作者", Colors.YELLOW))

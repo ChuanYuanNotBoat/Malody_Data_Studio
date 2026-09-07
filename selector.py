@@ -218,3 +218,25 @@ class MCSelector:
 
 
 global_selector = MCSelector()
+
+
+def deleted_sum_sql(alias: str = "c") -> str:
+    """SUM expression: count of charts with server_exists=1 (not deleted)."""
+    return f"SUM(CASE WHEN {alias}.server_exists = 1 THEN 1 ELSE 0 END)"
+
+
+def distinct_excl_sql(alias: str, column: str) -> str:
+    """DISTINCT count expression excluding deleted charts."""
+    return f"COUNT(DISTINCT CASE WHEN {alias}.server_exists = 1 THEN {column} END)"
+
+
+def format_dual_count(excl, incl) -> str:
+    """Format as 'excl (incl)'; show only the number when equal."""
+    try:
+        excl = int(excl or 0)
+        incl = int(incl or 0)
+    except (TypeError, ValueError):
+        return str(excl)
+    if incl > excl:
+        return f"{excl} ({incl})"
+    return str(excl)

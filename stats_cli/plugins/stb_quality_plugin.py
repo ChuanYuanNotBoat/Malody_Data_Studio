@@ -67,12 +67,17 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         else:
             print(colorize("✅ 数据质量良好，未发现问题", Colors.GREEN))
 
-        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
-        total_charts = cursor.fetchone()[0]
+        cursor.execute(
+            f"SELECT COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause}",
+            params,
+        )
+        _row = cursor.fetchone()
+        total_charts = _row[0]
+        total_charts_excl = _row[1] or 0
 
         completeness_stats = []
         if total_charts > 0:
-            completeness_stats.append(f"总谱面数: {total_charts}")
+            completeness_stats.append(f"总谱面数: {total_charts_excl} ({total_charts}，含已删除)")
             creator_completeness = ((total_charts - missing_creator) / total_charts) * 100
             completeness_stats.append(f"创作者完整性: {creator_completeness:.1f}%")
             level_completeness = ((total_charts - missing_level) / total_charts) * 100

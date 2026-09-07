@@ -42,7 +42,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         query = f"""
         SELECT c.cid, c.version, c.level, c.status, s.title, s.artist,
-            c.creator_name, c.stabled_by_name, c.heat, c.donate_count, c.play_count, c.last_updated
+            c.creator_name, c.stabled_by_name, c.heat, c.donate_count, c.play_count, c.last_updated, c.server_exists
         FROM charts c
         JOIN songs s ON c.sid = s.sid
         WHERE {where_clause}
@@ -69,11 +69,14 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         print(colorize(f"\n热门谱面排行榜 (按{field_names[sort_field]}排序)", Colors.CYAN))
         print(colorize(f"模式: {mode_str}", Colors.YELLOW))
         print(colorize(f"筛选条件: {self.selector.get_current_selection()}", Colors.YELLOW))
+        print(colorize("(* 前缀表示已从服务器删除的谱面)", Colors.YELLOW))
         print(get_separator())
 
-        for i, (cid, version, level, status, title, artist, creator, stabled, heat, donate, play, updated) in enumerate(results, 1):
+        for i, (cid, version, level, status, title, artist, creator, stabled, heat, donate, play, updated, server_exists) in enumerate(results, 1):
             status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
             rank_color = Colors.YELLOW if i <= 3 else Colors.WHITE
+            if not server_exists:
+                title = "*" + title
 
             print(f"{colorize(f'#{i}', rank_color)} {colorize(title, Colors.BOLD)} - {artist}")
             print(f"  版本: {version}, 难度: Lv.{level}, 状态: {status_name}")

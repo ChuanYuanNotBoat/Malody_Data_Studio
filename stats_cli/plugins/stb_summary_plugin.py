@@ -2,6 +2,8 @@ import os
 
 import matplotlib.pyplot as plt
 
+from selector import format_dual_count
+
 
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
@@ -45,17 +47,29 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             where_clause += " AND c.mode = ?" if where_clause != "1=1" else " AND c.mode = ?"
             params.append(mode)
 
-        cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
-        stats["total_charts"] = cursor.fetchone()[0]
-
-        cursor.execute(f"SELECT COUNT(DISTINCT c.sid) FROM charts c WHERE {where_clause}", params)
-        stats["unique_songs"] = cursor.fetchone()[0]
-
         cursor.execute(
-            f"SELECT COUNT(DISTINCT c.creator_name) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL",
+            f"SELECT COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause}",
             params,
         )
-        stats["unique_creators"] = cursor.fetchone()[0]
+        _row = cursor.fetchone()
+        stats["total_charts"] = _row[0]
+        stats["total_charts_excl"] = _row[1] or 0
+
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT c.sid), COUNT(DISTINCT CASE WHEN c.server_exists = 1 THEN c.sid END) FROM charts c WHERE {where_clause}",
+            params,
+        )
+        _row = cursor.fetchone()
+        stats["unique_songs"] = _row[0]
+        stats["unique_songs_excl"] = _row[1] or 0
+
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT c.creator_name), COUNT(DISTINCT CASE WHEN c.server_exists = 1 THEN c.creator_name END) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL",
+            params,
+        )
+        _row = cursor.fetchone()
+        stats["unique_creators"] = _row[0]
+        stats["unique_creators_excl"] = _row[1] or 0
 
         cursor.execute(
             f"SELECT MIN(c.last_updated), MAX(c.last_updated) FROM charts c WHERE {where_clause} AND c.last_updated IS NOT NULL",
@@ -79,12 +93,15 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         level_stats = cursor.fetchone()
         stats["level_stats"] = {"avg": level_stats[0] or 0, "max": level_stats[1] or 0, "min": level_stats[2] or 0}
 
-        cursor.execute(f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status", params)
-        stats["status_dist"] = dict(cursor.fetchall())
+        cursor.execute(
+            f"SELECT c.status, COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause} GROUP BY c.status",
+            params,
+        )
+        stats["status_dist"] = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
         if detail_level == "detailed":
             cursor.execute(
-                f"SELECT c.creator_name, COUNT(*) as count FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY count DESC LIMIT 20",
+                f"SELECT c.creator_name, COUNT(*) as count, SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) as count_excl FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY count DESC LIMIT 20",
                 params,
             )
             stats["top_creators"] = cursor.fetchall()
@@ -121,9 +138,12 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         print(get_separator())
 
         print(colorize("\n基础概览", Colors.BOLD))
-        print(f"  总谱面数: {colorize(stats['total_charts'], Colors.GREEN)}")
-        print(f"  唯一歌曲数: {stats['unique_songs']}")
-        print(f"  创作者数: {stats['unique_creators']}")
+        total_excl = stats.get("total_charts_excl", stats["total_charts"])
+        print(f"  总谱面数: {colorize(format_dual_count(total_excl, stats['total_charts']), Colors.GREEN)}")
+        print(f"  唯一歌曲数: {format_dual_count(stats.get('unique_songs_excl', stats['unique_songs']), stats['unique_songs'])}")
+        print(f"  创作者数: {format_dual_count(stats.get('unique_creators_excl', stats['unique_creators']), stats['unique_creators'])}")
+        if stats["total_charts"] > total_excl:
+            print(colorize("  （括号内为包含已删除谱面的数量，* 前缀表示已删除谱面）", Colors.YELLOW))
 
         if stats["first_update"] and stats["last_update"]:
             first_date = (
@@ -153,16 +173,19 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         print(colorize("\n状态分布", Colors.BOLD))
         status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
-        for status, count in stats["status_dist"].items():
+        for status, value in stats["status_dist"].items():
+            count, count_excl = value if isinstance(value, tuple) else (value, value)
             status_name = status_names.get(status, f"未知({status})")
-            percentage = (count / stats["total_charts"]) * 100 if stats["total_charts"] else 0
-            print(f"  {status_name}: {count} ({percentage:.1f}%)")
+            percentage = (count_excl / total_excl) * 100 if total_excl else 0
+            print(f"  {status_name}: {format_dual_count(count_excl, count)} ({percentage:.1f}%)")
 
         if detail_level == "detailed":
             print(colorize("\n顶级创作者(前10)", Colors.BOLD))
-            for i, (creator, count) in enumerate(stats["top_creators"][:10], 1):
-                percentage = (count / stats["total_charts"]) * 100 if stats["total_charts"] else 0
-                print(f"  {i:2d}. {creator}: {count} 谱面 ({percentage:.1f}%)")
+            for i, row in enumerate(stats["top_creators"][:10], 1):
+                creator, count = row[0], row[1]
+                count_excl = row[2] if len(row) > 2 else count
+                percentage = (count_excl / total_excl) * 100 if total_excl else 0
+                print(f"  {i:2d}. {creator}: {format_dual_count(count_excl, count)} 谱面 ({percentage:.1f}%)")
 
             print(colorize("\n热度分布", Colors.BOLD))
             total_with_heat = stats["total_charts"] - stats["zero_heat"]
@@ -184,7 +207,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
         status_labels = [status_names.get(s, f"未知({s})") for s in stats["status_dist"].keys()]
-        status_sizes = list(stats["status_dist"].values())
+        status_sizes = [v[0] if isinstance(v, tuple) else v for v in stats["status_dist"].values()]
         colors1 = ["#ff9999", "#66b3ff", "#99ff99"]
         ax1.pie(status_sizes, labels=status_labels, autopct="%1.1f%%", colors=colors1, startangle=90)
         ax1.set_title("状态分布")

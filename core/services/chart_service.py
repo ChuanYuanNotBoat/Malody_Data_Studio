@@ -624,9 +624,10 @@ class ChartService:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT COUNT(*) as total,
+                   SUM(CASE WHEN server_exists = 1 THEN 1 ELSE 0 END) as total_excl,
                    COUNT(DISTINCT mode) as modes,
-                   AVG(heat) as avg_heat,
-                   AVG(CAST(level AS REAL)) as avg_level
+                   AVG(CASE WHEN server_exists = 1 THEN heat END) as avg_heat,
+                   AVG(CASE WHEN server_exists = 1 THEN CAST(level AS REAL) END) as avg_level
             FROM charts
             WHERE stabled_by_name LIKE ? AND status = 2
         """, (f"%{player_name}%",))
@@ -634,9 +635,10 @@ class ChartService:
         conn.close()
         return {
             "total": stats[0],
-            "modes": stats[1],
-            "avg_heat": float(stats[2]) if stats[2] else 0,
-            "avg_level": float(stats[3]) if stats[3] else 0
+            "total_excluding_deleted": stats[1] or 0,
+            "modes": stats[2],
+            "avg_heat": float(stats[3]) if stats[3] else 0,
+            "avg_level": float(stats[4]) if stats[4] else 0
         }
 
     @db_safe_operation
@@ -646,7 +648,7 @@ class ChartService:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT c.cid, s.title, s.artist, c.version, c.level, c.mode, c.status,
-                   c.heat, c.donate_count, c.play_count, c.last_updated
+                   c.heat, c.donate_count, c.play_count, c.last_updated, c.server_exists
             FROM charts c
             JOIN songs s ON c.sid = s.sid
             WHERE c.stabled_by_name LIKE ? AND c.status = 2
@@ -694,7 +696,8 @@ class ChartService:
                     "status": row[5],
                     "creator_name": row[6],
                     "heat": row[7],
-                    "donate_count": row[8]
+                    "donate_count": row[8],
+                    "deleted": bool(row[9])
                 } for row in results
             ]
 

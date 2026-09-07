@@ -52,12 +52,16 @@ class PlayerHistoryPoint(BaseModel):
     rank: int = Field(..., description="排名")
 
 class ChartStats(BaseModel):
-    total_charts: int = Field(..., description="总谱面数")
+    total_charts: int = Field(..., description="总谱面数（含已删除）")
+    total_charts_excluding_deleted: int = Field(0, description="排除已删除后的总谱面数")
+    deleted_charts: int = Field(0, description="已删除谱面数")
     unique_songs: int = Field(..., description="唯一歌曲数")
     unique_creators: int = Field(..., description="创作者数")
     status_distribution: Dict[str, int] = Field(..., description="状态分布")
     level_distribution: Dict[str, int] = Field(..., description="难度分布")
     heat_stats: Dict[str, float] = Field(..., description="热度统计")
+    unique_songs_excluding_deleted: int = Field(0, description="排除已删除后的唯一歌曲数")
+    unique_creators_excluding_deleted: int = Field(0, description="排除已删除后的创作者数")
 
 class HotChart(BaseModel):
     cid: int = Field(..., description="谱面ID")
@@ -69,6 +73,7 @@ class HotChart(BaseModel):
     creator_name: str = Field(..., description="创作者")
     heat: int = Field(..., description="热度")
     donate_count: int = Field(..., description="打赏数")
+    deleted: bool = Field(False, description="是否已从服务器删除")
 
 class CreatorStats(BaseModel):
     creator_name: str = Field(..., description="创作者名")

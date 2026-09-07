@@ -4,6 +4,8 @@ from datetime import datetime
 
 import matplotlib.pyplot as plt
 
+from selector import format_dual_count
+
 
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
@@ -47,7 +49,8 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             SELECT
                 c.stabled_by_name,
                 COUNT(*) as stable_count,
-                AVG(c.heat) as avg_heat,
+                SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) as stable_count_excl,
+                AVG(CASE WHEN c.server_exists = 1 THEN c.heat END) as avg_heat,
                 MAX(c.heat) as max_heat,
                 MIN(c.last_updated) as first_stable,
                 MAX(c.last_updated) as last_stable
@@ -81,7 +84,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             )
             print(get_separator())
 
-            for i, (stabilizer, count, avg_heat, max_heat, first_stable, last_stable) in enumerate(results, 1):
+            for i, (stabilizer, count, count_excl, avg_heat, max_heat, first_stable, last_stable) in enumerate(results, 1):
                 display_stabilizer = stabilizer if len(stabilizer) <= 20 else stabilizer[:17] + "..."
 
                 def format_date(date_value):
@@ -100,7 +103,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     header_format.format(
                         f"#{i}",
                         display_stabilizer,
-                        count,
+                        format_dual_count(count_excl, count),
                         f"{avg_heat:.1f}" if avg_heat else "N/A",
                         f"{max_heat:.0f}" if max_heat else "N/A",
                         first_date,
@@ -111,11 +114,13 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             print(get_separator())
 
             total_stable = sum(row[1] for row in results)
-            avg_stable = total_stable / len(results)
-            max_stable = max(row[1] for row in results)
+            total_stable_excl = sum(row[2] for row in results)
+            avg_stable = total_stable_excl / len(results)
+            max_stable = max(row[2] for row in results)
 
             print(colorize("\n统计信息:", Colors.BOLD))
-            print(f"  总稳定谱面数: {total_stable}")
+            print(f"  总稳定谱面数: {format_dual_count(total_stable_excl, total_stable)}")
+            print(colorize("  (括号内为包含已删除谱面的数量，其余统计已排除已删除谱面)", Colors.YELLOW))
             print(f"  平均每人稳定谱面: {avg_stable:.1f}")
             print(f"  最高稳定谱面数: {max_stable}")
 

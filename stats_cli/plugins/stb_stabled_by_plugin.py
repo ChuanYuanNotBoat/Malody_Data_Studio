@@ -47,7 +47,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         query = f"""
         SELECT c.cid, s.title, s.artist, c.version, c.level, c.mode, c.status,
-               c.heat, c.donate_count, c.play_count, c.last_updated
+               c.heat, c.donate_count, c.play_count, c.last_updated, c.server_exists
         FROM charts c
         JOIN songs s ON c.sid = s.sid
         WHERE {where_clause}
@@ -67,9 +67,13 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         print(colorize(f"模式: {mode if mode != -1 else '所有'}", Colors.YELLOW))
         print(get_separator())
 
-        for cid, title, artist, version, level, m, status, heat, donate, play, updated in results:
+        print(colorize("(* 前缀表示已从服务器删除的谱面)", Colors.YELLOW))
+
+        for cid, title, artist, version, level, m, status, heat, donate, play, updated, server_exists in results:
             status_name = {0: "Alpha", 1: "Beta", 2: "Stable"}.get(status, "Unknown")
             mode_name = self.mode_names.get(m, "未知")
+            if not server_exists:
+                title = "*" + title
             print(f"{title} - {artist}")
             print(f"  CID:{cid} 模式:{m}({mode_name}) 难度:Lv.{level} 状态:{status_name}")
             print(f"  热度:{heat} 打赏:{donate} 游玩:{play}")
@@ -86,7 +90,11 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             status_value = row[6]
             status_dist[status_value] = status_dist.get(status_value, 0) + 1
 
-        print(f"总计: {total} 个谱面")
+        deleted_count = sum(1 for row in results if not row[11])
+        total_line = f"总计: {total} 个谱面 (包含已删除)"
+        if deleted_count:
+            total_line += f"，其中已删除 {deleted_count} 个"
+        print(total_line)
         print("模式分布:", ", ".join([f"{self.mode_names.get(m, '未知')}:{c}" for m, c in modes_dist.items()]))
         print("状态分布:", ", ".join([f"{['Alpha', 'Beta', 'Stable'][s]}:{c}" for s, c in status_dist.items()]))
 
@@ -98,7 +106,7 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         if not results:
             return
 
-        titles = [row[1] for row in results]
+        titles = [("*" if not row[11] else "") + row[1] for row in results]
         heats = [row[7] or 0 for row in results]
         levels = [row[4] for row in results]
         display_titles = [t[:17] + "..." if len(t) > 20 else t for t in titles]

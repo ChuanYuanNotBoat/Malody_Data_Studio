@@ -3,6 +3,8 @@ import re
 
 import matplotlib.pyplot as plt
 
+from selector import format_dual_count
+
 
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
@@ -44,26 +46,39 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                 where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
                 params.append(mode)
 
-            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
-            total_charts = cursor.fetchone()[0]
+            cursor.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause}",
+                params,
+            )
+            _row = cursor.fetchone()
+            total_charts = _row[0]
+            total_charts_excl = _row[1] or 0
 
             cursor.execute(
-                f"SELECT COUNT(DISTINCT c.creator_name) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL",
+                f"SELECT COUNT(DISTINCT CASE WHEN c.server_exists = 1 THEN c.creator_name END) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL",
                 params,
             )
             unique_creators = cursor.fetchone()[0]
 
-            cursor.execute(f"SELECT AVG(c.heat) FROM charts c WHERE {where_clause} AND c.heat > 0", params)
+            cursor.execute(
+                f"SELECT AVG(CASE WHEN c.server_exists = 1 THEN c.heat END) FROM charts c WHERE {where_clause} AND c.heat > 0",
+                params,
+            )
             avg_heat = cursor.fetchone()[0] or 0
 
             cursor.execute(
-                f"SELECT AVG(CAST(c.level AS REAL)) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0",
+                f"SELECT AVG(CASE WHEN c.server_exists = 1 THEN CAST(c.level AS REAL) END) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0",
                 params,
             )
             avg_level = cursor.fetchone()[0] or 0
 
-            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause} AND c.status = 2", params)
-            stable_charts = cursor.fetchone()[0]
+            cursor.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause} AND c.status = 2",
+                params,
+            )
+            _row = cursor.fetchone()
+            stable_charts = _row[0]
+            stable_charts_excl = _row[1] or 0
 
             mode_name = self.mode_names.get(mode, "未知")
             comparison_data.append(
@@ -71,11 +86,13 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
                     "mode": mode,
                     "name": mode_name,
                     "total_charts": total_charts,
+                    "total_charts_excl": total_charts_excl,
                     "unique_creators": unique_creators,
                     "avg_heat": avg_heat,
                     "avg_level": avg_level,
                     "stable_charts": stable_charts,
-                    "stability_rate": (stable_charts / total_charts * 100) if total_charts > 0 else 0,
+                    "stable_charts_excl": stable_charts_excl,
+                    "stability_rate": (stable_charts_excl / total_charts_excl * 100) if total_charts_excl > 0 else 0,
                 }
             )
 
@@ -83,12 +100,13 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
 
         header = f"{'模式':<10} {'模式名':<12} {'总谱面':<8} {'创作者':<8} {'平均热度':<10} {'平均难度':<10} {'稳定率':<8}"
         print(header)
+        print(colorize("(总谱面列: 括号内为包含已删除谱面的数量，其余统计已排除已删除谱面)", Colors.YELLOW))
         print(get_separator())
 
         for data in comparison_data:
             mode_str = f"{data['mode']} ({data['name']})"
             print(
-                f"{mode_str:<10} {data['name']:<12} {data['total_charts']:<8} {data['unique_creators']:<8} "
+                f"{mode_str:<10} {data['name']:<12} {format_dual_count(data['total_charts_excl'], data['total_charts']):<8} {data['unique_creators']:<8} "
                 f"{data['avg_heat']:<10.1f} {data['avg_level']:<10.1f} {data['stability_rate']:<8.1f}%"
             )
 

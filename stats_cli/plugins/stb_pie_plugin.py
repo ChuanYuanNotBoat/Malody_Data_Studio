@@ -45,6 +45,8 @@ def install(cls, *, colorize, colors, db_safe_operation):
             where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
             params.append(mode)
 
+        where_clause += " AND c.server_exists = 1"
+
         cursor.execute(
             f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
             params,
@@ -73,7 +75,7 @@ def install(cls, *, colorize, colors, db_safe_operation):
 
         mode_name = self.mode_names.get(mode, "未知")
         ax.set_title(
-            f"谱面状态分布 - 模式 {mode} ({mode_name})\n筛选条件: {self.selector.get_current_selection()}",
+            f"谱面状态分布 - 模式 {mode} ({mode_name})\n筛选条件: {self.selector.get_current_selection()}\n(已排除已删除谱面)",
             fontsize=14,
             fontweight="bold",
         )
@@ -94,7 +96,7 @@ def install(cls, *, colorize, colors, db_safe_operation):
             where_clause += " AND c.mode = ?" if where_clause != "1=1" else "c.mode = ?"
             params.append(mode)
 
-        where_clause += " AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0"
+        where_clause += " AND c.level IS NOT NULL AND c.level != '' AND CAST(c.level AS REAL) > 0 AND c.server_exists = 1"
 
         cursor.execute(
             f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
@@ -140,7 +142,7 @@ def install(cls, *, colorize, colors, db_safe_operation):
 
         mode_name = self.mode_names.get(mode, "未知")
         ax.set_title(
-            f"谱面难度分布 - 模式 {mode} ({mode_name})\n筛选条件: {self.selector.get_current_selection()}",
+            f"谱面难度分布 - 模式 {mode} ({mode_name})\n筛选条件: {self.selector.get_current_selection()}\n(已排除已删除谱面)",
             fontsize=14,
             fontweight="bold",
         )

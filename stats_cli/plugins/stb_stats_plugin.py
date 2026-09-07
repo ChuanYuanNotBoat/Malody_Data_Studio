@@ -1,3 +1,6 @@
+from selector import format_dual_count
+
+
 def install(cls, *, colorize, colors, db_safe_operation, get_separator):
     Colors = colors
 
@@ -36,27 +39,32 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
         stats = {}
 
         try:
-            cursor.execute(f"SELECT COUNT(*) FROM charts c WHERE {where_clause}", params)
-            stats["total_charts"] = cursor.fetchone()[0] or 0
+            cursor.execute(
+                f"SELECT COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause}",
+                params,
+            )
+            _row = cursor.fetchone()
+            stats["total_charts"] = _row[0] or 0
+            stats["total_charts_excl"] = _row[1] or 0
 
             cursor.execute(
-                f"SELECT c.status, COUNT(*) FROM charts c WHERE {where_clause} GROUP BY c.status",
+                f"SELECT c.status, COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause} GROUP BY c.status",
                 params,
             )
             status_results = cursor.fetchall()
             stats["status_dist"] = {0: 0, 1: 0, 2: 0}
-            for status, count in status_results:
+            for status, count, count_excl in status_results:
                 if status in [0, 1, 2]:
-                    stats["status_dist"][status] = count
+                    stats["status_dist"][status] = (count, count_excl)
 
             cursor.execute(
-                f"SELECT c.level, COUNT(*) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
+                f"SELECT c.level, COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause} AND c.level IS NOT NULL AND c.level != '' GROUP BY c.level ORDER BY CAST(c.level AS REAL)",
                 params,
             )
-            stats["level_dist"] = dict(cursor.fetchall())
+            stats["level_dist"] = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
             cursor.execute(
-                f"SELECT c.creator_name, COUNT(*) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY COUNT(*) DESC LIMIT 10",
+                f"SELECT c.creator_name, COUNT(*), SUM(CASE WHEN c.server_exists = 1 THEN 1 ELSE 0 END) FROM charts c WHERE {where_clause} AND c.creator_name IS NOT NULL GROUP BY c.creator_name ORDER BY COUNT(*) DESC LIMIT 10",
                 params,
             )
             stats["top_creators"] = cursor.fetchall()
@@ -96,25 +104,31 @@ def install(cls, *, colorize, colors, db_safe_operation, get_separator):
             print(colorize("没有找到符合条件的谱面", Colors.YELLOW))
             return
 
-        print(f"总谱面数: {colorize(stats['total_charts'], Colors.GREEN)}")
+        print(f"总谱面数: {colorize(format_dual_count(stats.get('total_charts_excl', stats['total_charts']), stats['total_charts']), Colors.GREEN)}")
+        if stats['total_charts'] > stats.get('total_charts_excl', 0):
+            print(colorize("（括号内为包含已删除谱面的数量，* 前缀表示已删除谱面）", Colors.YELLOW))
 
         if stats["status_dist"]:
             print(f"\n{colorize('状态分布:', Colors.BOLD)}")
             status_names = {0: "Alpha", 1: "Beta", 2: "Stable"}
             for status in [0, 1, 2]:
-                count = stats["status_dist"].get(status, 0)
+                value = stats["status_dist"].get(status, 0)
+                count, count_excl = value if isinstance(value, tuple) else (value, value)
                 status_name = status_names.get(status, f"未知({status})")
-                print(f"  {status_name}: {count}")
+                print(f"  {status_name}: {format_dual_count(count_excl, count)}")
 
         if stats["level_dist"]:
             print(f"\n{colorize('难度分布:', Colors.BOLD)}")
-            for level, count in sorted(stats["level_dist"].items(), key=lambda x: float(x[0])):
-                print(f"  Lv.{level}: {count}")
+            for level, value in sorted(stats["level_dist"].items(), key=lambda x: float(x[0])):
+                count, count_excl = value if isinstance(value, tuple) else (value, value)
+                print(f"  Lv.{level}: {format_dual_count(count_excl, count)}")
 
         if stats["top_creators"]:
             print(f"\n{colorize('热门创作者:', Colors.BOLD)}")
-            for creator, count in stats["top_creators"]:
-                print(f"  {creator}: {count} 个谱面")
+            for row in stats["top_creators"]:
+                creator, count = row[0], row[1]
+                count_excl = row[2] if len(row) > 2 else count
+                print(f"  {creator}: {format_dual_count(count_excl, count)} 个谱面")
 
         print(f"\n{colorize('热度统计:', Colors.BOLD)}")
         print(f"  平均热度: {stats['heat_avg']:.1f}")
