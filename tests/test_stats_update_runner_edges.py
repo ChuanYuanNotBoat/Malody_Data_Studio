@@ -1,4 +1,4 @@
-import io
+﻿import io
 import os
 import sys
 from pathlib import Path
@@ -89,7 +89,7 @@ class TestStatsUpdateRunnerEdges(TestCase):
             cmd,
             [
                 "python",
-                os.path.join(".", "player_profile_crawler.py"),
+                os.path.join(".", "crawlers/player_profile.py"),
                 "--uid",
                 "1001",
                 "--uid-list",
@@ -148,7 +148,7 @@ class TestStatsUpdateRunnerEdges(TestCase):
             cmd,
             [
                 "python",
-                os.path.join(".", "stb_crawler.py"),
+                os.path.join(".", "crawlers/stb.py"),
                 "--source",
                 "api",
                 "--max-charts",

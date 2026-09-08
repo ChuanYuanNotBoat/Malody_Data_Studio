@@ -1,4 +1,4 @@
-import os
+﻿import os
 import sys
 from pathlib import Path
 from unittest import TestCase
@@ -21,7 +21,7 @@ class TestStatsUpdateRunner(TestCase):
 
     def test_build_update_default_leaderboard(self):
         cmd = build_update_command([], ".", "python", _colorize, "RED", "YELLOW")
-        self.assertEqual(cmd, ["python", os.path.join(".", "malody_rankings.py"), "--once"])
+        self.assertEqual(cmd, ["python", os.path.join(".", "crawlers/rankings.py"), "--once"])
 
     def test_build_update_player_unknown_flag(self):
         cmd = build_update_command(["--player", "--unknown"], ".", "python", _colorize, "RED", "YELLOW")
@@ -40,7 +40,7 @@ class TestStatsUpdateRunner(TestCase):
             cmd,
             [
                 "python",
-                os.path.join(".", "stb_crawler.py"),
+                os.path.join(".", "crawlers/stb.py"),
                 "--max-charts",
                 "30",
                 "--sid-crawl",

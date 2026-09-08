@@ -1,7 +1,7 @@
-param(
+﻿param(
   [string]$Python = "python",
   [string]$BaseUrl = "http://127.0.0.1:18765",
-  [string]$DbPath = "malody_rankings.db",
+  [string]$DbPath = "data/malody_rankings.db",
   [string]$Modes = "0,3,5",
   [string]$Limits = "20,50",
   [double]$DefaultThreshold = 0,
@@ -15,7 +15,7 @@ Write-Host "== Gate 1/3: unit tests =="
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "== Gate 2/3: compileall =="
-& $Python -m compileall -q run.py routers core utils stats_cli scripts tests
+& $Python -m compileall -q run.py app routers core utils cli stats_cli crawlers scripts tests
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "== Gate 3/3: stats/api consistency =="

@@ -64,7 +64,7 @@ while ($true) {
     try {
         $runArgs = @()
         $runArgs += $pythonPrefix
-        $runArgs += @(".\malody_rankings.py", "--mm-only", "--mm-limit", "$MmLimit")
+        $runArgs += @(".\crawlers\rankings.py", "--mm-only", "--mm-limit", "$MmLimit")
         $runOutput = & $pythonExe @runArgs 2>&1 | ForEach-Object { $_.ToString() }
         $runOutput | Set-Content -Path $lastRunLog -Encoding UTF8
         $exitCode = $LASTEXITCODE

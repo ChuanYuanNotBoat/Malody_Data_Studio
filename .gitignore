@@ -19,9 +19,9 @@ malody_api/routers/__pycache__/
 malody_api/utils/__pycache__/
 
 # 进度记录文件
-sid_progress.json
-cid_progress.json
-sid_backwards_progress.json
+data/sid_progress.json
+data/cid_progress.json
+data/sid_backwards_progress.json
 
 # 输出目录
 viz_output/*
@@ -54,8 +54,8 @@ mod_mapping.json   # 如果不需要跟踪可以保留，否则移除
 # 其他
 .malody_stats.py.swp
 crawler_resume.bin
-config.yaml
-cookies.local.json
+data/config.yaml
+data/cookies.local.json
 controller.log
 global_progress.bin
 

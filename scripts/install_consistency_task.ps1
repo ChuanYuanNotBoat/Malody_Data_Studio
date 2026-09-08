@@ -1,8 +1,8 @@
-param(
+﻿param(
   [string]$TaskName = "MalodyStatsApiConsistency",
   [string]$Python = "python",
   [string]$BaseUrl = "http://127.0.0.1:18765",
-  [string]$DbPath = "malody_rankings.db",
+  [string]$DbPath = "data/malody_rankings.db",
   [string]$Modes = "0,3,5",
   [string]$Limits = "20,50",
   [string]$ThresholdRules = '{"quality.issues.":1}'

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import re
 import shlex
 import subprocess
@@ -22,14 +22,14 @@ class FlagSpec:
 
 UPDATE_OPTION_SCHEMAS: Dict[str, Dict[str, object]] = {
     "leaderboard": {
-        "script": "malody_rankings.py",
+        "script": "crawlers/rankings.py",
         "flags": {
             "--once": FlagSpec(flag="--once", value_type="bool", target="--once"),
         },
         "defaults": ["--once"],
     },
     "player": {
-        "script": "player_profile_crawler.py",
+        "script": "crawlers/player_profile.py",
         "flags": {
             "--uid": FlagSpec(flag="--uid", value_type="str"),
             "--uid-list": FlagSpec(flag="--uid-list", value_type="str"),
@@ -60,7 +60,7 @@ UPDATE_OPTION_SCHEMAS: Dict[str, Dict[str, object]] = {
         "ignored_flags": ["--once"],
     },
     "stb": {
-        "script": "stb_crawler.py",
+        "script": "crawlers/stb.py",
         "flags": {
             "--once": FlagSpec(flag="--once", value_type="bool"),
             "--skip-test": FlagSpec(flag="--skip-test", value_type="bool"),

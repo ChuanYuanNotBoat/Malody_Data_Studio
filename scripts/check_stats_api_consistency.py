@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 检查关键统计指标在“数据库基准计算”和“API返回”之间的一致性，并输出差异报告。
 
@@ -289,7 +289,7 @@ def _parse_prefixes(raw: str) -> List[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Compare DB baseline stats with API responses.")
-    parser.add_argument("--db-path", default="malody_rankings.db")
+    parser.add_argument("--db-path", default="data/malody_rankings.db")
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--mode", type=int, default=-1)
     parser.add_argument("--modes", default="", help="Comma-separated mode list. If set, overrides --mode.")

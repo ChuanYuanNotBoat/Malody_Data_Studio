@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Read-only analysis for MM ranking + MMR trend data quality and coverage.
 
@@ -27,7 +27,7 @@ class ModeGapSummary:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Analyze MM/MMR data in read-only mode.")
-    parser.add_argument("--db-path", default="malody_rankings.db", help="SQLite DB path")
+    parser.add_argument("--db-path", default="data/malody_rankings.db", help="SQLite DB path")
     parser.add_argument("--players-file", default="players.txt", help="Manual tracked players file")
     parser.add_argument("--mm-limit", type=int, default=200, help="Top N MM players per mode for tracked set")
     parser.add_argument("--json", action="store_true", help="Output JSON-like blocks for easier parsing")

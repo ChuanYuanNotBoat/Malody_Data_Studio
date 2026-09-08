@@ -3,18 +3,18 @@
     {
       "name": "leaderboard_default",
       "tokens": [],
-      "expected_command_suffix": ["malody_rankings.py", "--once"]
+      "expected_command_suffix": ["rankings.py", "--once"]
     },
     {
       "name": "player_basic",
       "tokens": ["--player", "--uid", "1001", "--limit", "20", "--rpm", "60"],
-      "expected_command_suffix": ["player_profile_crawler.py", "--uid", "1001", "--limit", "20", "--rpm", "60"]
+      "expected_command_suffix": ["player_profile.py", "--uid", "1001", "--limit", "20", "--rpm", "60"]
     },
     {
       "name": "stb_sid_range_no_resume",
       "tokens": ["--stb", "--sid-crawl", "--start", "10", "--end", "20", "--limit", "30", "--resume", "false"],
       "expected_command_suffix": [
-        "stb_crawler.py",
+        "stb.py",
         "--max-charts",
         "30",
         "--sid-crawl",

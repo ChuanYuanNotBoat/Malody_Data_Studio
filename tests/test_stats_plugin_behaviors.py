@@ -1,4 +1,4 @@
-import io
+﻿import io
 import sqlite3
 import sys
 from pathlib import Path
@@ -118,7 +118,7 @@ class TestStatsPluginBehaviors(TestCase):
 
     def test_update_command_runs_streaming_command_on_success(self):
         shell = _ShellStub()
-        command = ["python", "stb_crawler.py"]
+        command = ["python", os.path.join(".", "crawlers", "stb.py")]
         with patch("malody_api.stats_cli.plugins.update_plugin.split_cli_args", return_value=["--stb"]), patch(
             "malody_api.stats_cli.plugins.update_plugin.build_update_command", return_value=command
         ) as build_mock, patch("malody_api.stats_cli.plugins.update_plugin.run_streaming_command") as run_mock:

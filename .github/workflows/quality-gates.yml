@@ -19,7 +19,7 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
       - name: Compile check
-        run: python -m compileall -q run.py routers core utils stats_cli scripts tests
+        run: python -m compileall -q run.py app routers core utils cli stats_cli crawlers scripts tests
 
   desktop-gates:
     runs-on: ubuntu-latest

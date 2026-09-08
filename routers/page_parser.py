@@ -44,7 +44,7 @@ MODE_MAP = {
 # 加载Mod映射配置（占位符）
 MOD_MAPPING = {}
 try:
-    mod_mapping_path = os.path.join(os.path.dirname(__file__), '..', 'mod_mapping.json')
+    mod_mapping_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'mod_mapping.json')
     with open(mod_mapping_path, 'r', encoding='utf-8') as f:
         MOD_MAPPING = json.load(f)
     logger.info("Loaded mod mapping entries: %s", len(MOD_MAPPING))
@@ -593,7 +593,7 @@ async def trigger_sid_update(sid: int) -> Dict[str, Any]:
     """触发SID更新"""
     try:
         current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        crawler_script = os.path.join(current_dir, "stb_crawler.py")
+        crawler_script = os.path.join(current_dir, "crawlers", "stb.py")
 
         if not os.path.exists(crawler_script):
             return {

@@ -221,9 +221,9 @@ async def run_crawler(
     del background_tasks  # kept for backward compatibility with old route signature
 
     script_map = {
-        "leaderboard": "malody_rankings.py",
-        "player": "player_profile_crawler.py",
-        "stb": "stb_crawler.py",
+        "leaderboard": os.path.join("crawlers", "rankings.py"),
+        "player": os.path.join("crawlers", "player_profile.py"),
+        "stb": os.path.join("crawlers", "stb.py"),
     }
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     script = os.path.join(base_dir, script_map[crawler_type])

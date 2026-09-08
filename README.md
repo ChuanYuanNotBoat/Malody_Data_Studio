@@ -45,11 +45,13 @@ pip install -r requirements.txt
 ```
 
 3. 准备数据库
-确保 `malody_rankings.db` 数据库文件位于项目根目录。
+确保 `data/malody_rankings.db` 数据库文件存在。
 
 4. 启动服务
 ```bash
-python run.py
+python run.py        # 兼容入口
+# 或
+python app/main.py   # 新入口
 ```
 
 服务将在 http://localhost:8000 启动，API 文档可在 http://localhost:8000/docs 查看。
@@ -190,7 +192,8 @@ GET /page-parser/song/12345?include_charts=true
 
 项目支持以下环境变量配置：
 
-- `MALODY_DB_PATH` - 数据库文件路径（默认：malody_rankings.db）
+- `MALODY_DB_PATH` - 数据库文件路径（默认：data/malody_rankings.db）
+- `MALODY_DATA_DIR` - 运行时数据目录（默认：data/，影响 cookies/进度文件/xlsx 导出位置）
 - `MALODY_API_HOST` - 服务绑定地址（默认：0.0.0.0）
 - `MALODY_API_PORT` - 服务端口（默认：8000）
 - `MALODY_DEBUG` - 调试模式（默认：false）
@@ -222,13 +225,25 @@ GET /page-parser/song/12345?include_charts=true
 
 ```
 malody_api/
-├── run.py                 # 主启动文件
-├── stb_crawler.py         # STB 谱面爬虫
-├── player_profile_crawler.py # 玩家资料爬虫
-├── malody_rankings.py     # 主爬虫
-├── requirements.txt       # Python 依赖
-├── malody_rankings.db    # SQLite 数据库
-├── core/                  # 核心模块
+├── run.py                   # 兼容入口（转发到 app/main.py）
+├── app/                     # FastAPI 服务
+│   ├── main.py              # 主启动文件
+│   └── config.py            # 服务配置
+├── crawlers/                # 爬虫子系统
+│   ├── rankings.py          # 主爬虫（原 malody_rankings.py）
+│   ├── player_profile.py    # 玩家资料爬虫（原 player_profile_crawler.py）
+│   ├── stb.py               # STB 谱面爬虫（原 stb_crawler.py）
+│   └── controller.py        # 爬虫编排控制器（原 crawler_controller.py）
+├── cli/                     # CLI 共享模块
+│   └── selector.py          # 数据筛选器（原根目录 selector.py）
+├── data/                    # 运行时数据（不入库）
+│   ├── malody_rankings.db   # SQLite 数据库
+│   ├── config.yaml          # 爬虫配置
+│   ├── cookies.local.json   # 会话凭据
+│   ├── mod_mapping.json     # MOD 映射
+│   └── *_progress.json      # 爬虫进度
+├── requirements.txt         # Python 依赖
+├── core/                    # 核心模块
 │   ├── database.py       # 数据库连接
 │   ├── models.py         # 数据模型
 │   └── services/         # 业务服务
@@ -275,11 +290,13 @@ To keep the project root cleaner while preserving current manual deployment beha
 - Example config moved to `examples/config.yaml.example`
 - Example cookies moved to `examples/cookies.local.example.json`
 
-Runtime files still expected in root for now:
+Runtime files now live in `data/`:
 
-- `config.yaml`
-- `cookies.local.json`
-- `malody_rankings.db`
+- `data/config.yaml`
+- `data/cookies.local.json`
+- `data/malody_rankings.db`
+
+(Old root-level paths are still accepted as fallback for compatibility.)
 
 ## Merge Gates / DoD
 
@@ -316,12 +333,12 @@ If structure failures rise, prioritize parser compatibility validation.
 ## Local Deployment Checklist
 
 1. Python and dependencies installed.
-2. `malody_rankings.db` available.
+2. `data/malody_rankings.db` available.
 3. Optional API key configured:
    - `MALODY_API_KEY` or `MALODY_API_TOKEN`
 4. Optional crawler/session files:
-   - `cookies.local.json`
-   - `config.yaml`
+   - `data/cookies.local.json`
+   - `data/config.yaml`
 5. Optional scheduled consistency task:
    - `powershell -ExecutionPolicy Bypass -File scripts/install_consistency_task.ps1`
 

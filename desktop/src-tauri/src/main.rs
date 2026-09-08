@@ -20,11 +20,13 @@ fn detect_project_root() -> PathBuf {
     // Walk up parent directories to find a valid project root.
     let mut cursor = Some(cwd.as_path());
     while let Some(dir) = cursor {
-        if dir.join("run.py").exists() {
+        if dir.join("app").join("main.py").exists() || dir.join("run.py").exists() {
             return dir.to_path_buf();
         }
         // Also accept repo layouts where package root is nested as "malody_api".
-        if dir.join("malody_api").join("run.py").exists() {
+        if dir.join("malody_api").join("run.py").exists()
+            || dir.join("malody_api").join("app").join("main.py").exists()
+        {
             return dir.join("malody_api");
         }
         cursor = dir.parent();
@@ -35,11 +37,17 @@ fn detect_project_root() -> PathBuf {
 }
 
 fn detect_run_py(root: &Path) -> PathBuf {
-    let p = root.join("run.py");
+    // 目录重整后的入口：app/main.py
+    let p = root.join("app").join("main.py");
     if p.exists() {
         return p;
     }
-    root.join("malody_api").join("run.py")
+    // 兼容旧布局的根目录 run.py
+    let legacy = root.join("run.py");
+    if legacy.exists() {
+        return legacy;
+    }
+    root.join("app").join("main.py")
 }
 
 fn spawn_backend(root: &Path) -> Result<Child, String> {

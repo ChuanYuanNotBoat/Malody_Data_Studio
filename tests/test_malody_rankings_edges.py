@@ -1,4 +1,4 @@
-import queue
+﻿import queue
 import re
 import sqlite3
 import sys
@@ -13,7 +13,7 @@ ROOT_PARENT = Path(__file__).resolve().parents[2]
 if str(ROOT_PARENT) not in sys.path:
     sys.path.insert(0, str(ROOT_PARENT))
 
-import malody_api.malody_rankings as rankings  # noqa: E402
+import malody_api.crawlers.rankings as rankings  # noqa: E402
 
 
 class TestMalodyRankingsEdges(TestCase):
