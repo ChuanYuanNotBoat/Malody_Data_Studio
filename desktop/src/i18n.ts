@@ -3,7 +3,9 @@
 type Dict = Record<string, string>;
 
 const zhCN: Dict = {
-  app_title: "Malody 增强桌面控制台",
+  app_title: "Malody 数据工作台",
+  brand_subtitle: "本地数据采集与分析",
+  local_console: "本地控制台",
   lang_label: "语言",
   tab_overview: "总览",
   tab_analytics: "数据分析",
@@ -104,6 +106,15 @@ const zhCN: Dict = {
   query_field_status: "状态",
   export: "导出",
   query_placeholder: "V1 预留高级查询/导出入口。当前可使用 /query/execute 与图表导出相关接口。",
+  overview_desc: "查看数据库、爬虫和数据质量的整体状态。",
+  analytics_desc: "按模式、玩家和时间窗口分析 Malody 数据。",
+  tasks_desc: "集中查看后台任务状态和结构化日志。",
+  crawler_desc: "配置并启动排行榜、玩家和 STB 数据采集任务。",
+  quality_desc: "运行数据质量检查并追踪问题清单。",
+  db_desc: "检查 SQLite 健康状态并执行受保护的维护操作。",
+  plugins_desc: "发现并运行可扩展的数据分析与维护插件。",
+  query_desc: "使用预置模板查询和导出结构化数据。",
+  crawler_snapshot: "爬虫快照",
   crawler_started: "爬虫任务已启动",
   quality_done: "质量检查完成",
   maintain_done: "维护执行完成",
@@ -149,7 +160,9 @@ const zhCN: Dict = {
 };
 
 const enUS: Dict = {
-  app_title: "Malody Enhanced Desktop Console",
+  app_title: "Malody Data Studio",
+  brand_subtitle: "Local data collection and analytics",
+  local_console: "Local Console",
   lang_label: "Language",
   tab_overview: "Overview",
   tab_analytics: "Analytics",
@@ -250,6 +263,15 @@ const enUS: Dict = {
   query_field_status: "Status",
   export: "Export",
   query_placeholder: "This V1 panel is reserved for advanced query/export workflows. Existing API endpoints are ready: /query/execute and chart export endpoints.",
+  overview_desc: "Monitor database, crawler, and data quality health at a glance.",
+  analytics_desc: "Analyze Malody data by mode, player, and time window.",
+  tasks_desc: "Track background operations and structured task logs in one place.",
+  crawler_desc: "Configure and launch leaderboard, player, and STB collection jobs.",
+  quality_desc: "Run data quality checks and review the issue list.",
+  db_desc: "Inspect SQLite health and run protected maintenance operations.",
+  plugins_desc: "Discover and run extensible analysis and maintenance plugins.",
+  query_desc: "Query and export structured data with predefined templates.",
+  crawler_snapshot: "Crawler Snapshot",
   crawler_started: "Crawler task started",
   quality_done: "Quality check finished",
   maintain_done: "Maintenance completed",

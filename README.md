@@ -1,12 +1,12 @@
-# Malody API
+# Malody Data Studio
 
-基于 Malody 游戏数据的 RESTful API 服务，提供玩家排名、谱面信息和排行榜数据查询功能。
+Malody 数据工作台：围绕数据采集、查询、分析和运维的本地化工具集。
 
 # **⚠️ 请不要对游戏官网设置高频率爬虫攻击 ⚠️**
 
 ## 项目简介
 
-Malody API 是一个基于 FastAPI 构建的 Web 服务，提供对 Malody 游戏数据的结构化访问。该项目源自 [malody_rankings](https://github.com/ChuanYuanNotBoat/malody_rankings) 爬虫项目，将其数据通过标准化的 API 接口对外提供。
+Malody Data Studio 是一个由 FastAPI、CLI 和 Tauri 桌面端组成的本地数据平台，提供对 Malody 游戏数据的结构化采集、访问和分析。该项目源自 [malody_rankings](https://github.com/ChuanYuanNotBoat/malody_rankings) 爬虫项目。
 
 ## 功能特性
 
@@ -35,8 +35,8 @@ Malody API 是一个基于 FastAPI 构建的 Web 服务，提供对 Malody 游�
 
 1. 克隆项目
 ```bash
-git clone https://github.com/ChuanYuanNotBoat/malody_api.git
-cd malody_api
+git clone https://github.com/ChuanYuanNotBoat/malody-data-studio.git
+cd malody-data-studio
 ```
 
 2. 安装依赖
@@ -224,7 +224,7 @@ GET /page-parser/song/12345?include_charts=true
 ### 项目结构
 
 ```
-malody_api/
+malody-data-studio/
 ├── run.py                   # 兼容入口（转发到 app/main.py）
 ├── app/                     # FastAPI 服务
 │   ├── main.py              # 主启动文件

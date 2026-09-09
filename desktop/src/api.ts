@@ -3,7 +3,7 @@ const DEFAULT_BASES = ["http://127.0.0.1:18765", "http://127.0.0.1:8000"];
 const API_BASE_KEY = "app.api_base";
 export const API_BASE = DEFAULT_BASES[0];
 
-type ApiEnvelope<T> = {
+export type ApiEnvelope<T> = {
   success: boolean;
   data: T;
   message?: string;
@@ -37,7 +37,7 @@ function rememberApiBase(base: string) {
 async function request<T>(path: string, init?: RequestOptions): Promise<T> {
   const timeoutMs = init?.timeoutMs ?? REQUEST_TIMEOUT_MS;
   const bases = getCandidateApiBases();
-  const perAttemptTimeoutMs = bases.length > 1 ? Math.min(timeoutMs, 5000) : timeoutMs;
+  const perAttemptTimeoutMs = timeoutMs;
   let lastNetworkError: unknown = null;
 
   for (const base of bases) {
@@ -53,6 +53,9 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
       });
     } catch (error) {
       clearTimeout(timeout);
+      if (error instanceof Error && error.name === "AbortError") {
+        throw new Error(`Request timeout (${timeoutMs}ms): ${path}`);
+      }
       lastNetworkError = error;
       continue;
     }
@@ -68,7 +71,7 @@ async function request<T>(path: string, init?: RequestOptions): Promise<T> {
 
     if (!response.ok || !json || !json.success) {
       const detail = json?.error || json?.message || "unknown error";
-      throw new Error(`HTTP ${response.status} ${base}${path}: ${detail}`);
+      throw new Error(`HTTP ${response.status} ${path}: ${detail}`);
     }
 
     rememberApiBase(base);
@@ -189,7 +192,7 @@ export async function getPredefinedQueries() {
   return request<Record<string, any>>("/query/predefined-queries");
 }
 
-type AdvancedQueryPayload = {
+export type AdvancedQueryPayload = {
   table: string;
   columns?: string[];
   filters?: Array<Record<string, unknown>>;

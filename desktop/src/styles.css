@@ -4,6 +4,7 @@ body,
   width: 100%;
   height: 100%;
   margin: 0;
+  font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif;
 }
 
 .app-shell {
@@ -11,14 +12,118 @@ body,
   background: linear-gradient(150deg, #f4f8fb 0%, #eef3ff 100%);
 }
 
-.app-header {
-  background: linear-gradient(95deg, #19324a 0%, #2e567d 100%);
+.app-sider {
+  border-right: 1px solid #e6edf5;
+  box-shadow: 2px 0 12px rgba(31, 55, 80, 0.04);
+}
+
+.brand-block {
   display: flex;
   align-items: center;
+  gap: 12px;
+  min-height: 76px;
+  padding: 16px;
+  border-bottom: 1px solid #edf1f5;
+}
+
+.brand-mark {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  place-items: center;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #1677ff, #6c5ce7);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.brand-title {
+  margin: 0 !important;
+  font-size: 15px !important;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 24px;
+  background: linear-gradient(95deg, #19324a 0%, #2e567d 100%);
+}
+
+.header-title-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.app-title {
+  margin: 0 !important;
+  color: #fff !important;
+}
+
+.header-label {
+  color: #fff;
 }
 
 .app-content {
-  padding: 20px;
+  min-height: calc(100vh - 64px);
+  padding: 24px;
+}
+
+.page-frame {
+  max-width: 1600px;
+  margin: 0 auto;
+}
+
+.page-heading {
+  margin-bottom: 20px;
+}
+
+.page-heading h2 {
+  margin: 0 0 4px;
+}
+
+.section-row,
+.section-card,
+.table-spacing {
+  margin-top: 16px;
+}
+
+.stretch-card {
+  height: 100%;
+}
+
+.section-actions {
+  margin-top: 16px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 16px;
+}
+
+.plugin-card {
+  width: calc(33.333% - 11px);
+  min-width: 260px;
+}
+
+.query-template.selected {
+  border-color: #1677ff;
+  box-shadow: 0 0 0 1px rgba(22, 119, 255, 0.15);
+}
+
+.table-summary {
+  margin-bottom: 12px;
+}
+
+.inline-error {
+  display: block;
+  margin-top: 12px;
 }
 
 pre {
@@ -27,3 +132,25 @@ pre {
   word-break: break-word;
 }
 
+@media (max-width: 768px) {
+  .app-header {
+    padding: 0 12px;
+  }
+
+  .app-title {
+    font-size: 18px !important;
+  }
+
+  .app-content {
+    padding: 16px 12px;
+  }
+
+  .header-label,
+  .header-title-group .ant-tag {
+    display: none;
+  }
+
+  .plugin-card {
+    width: 100%;
+  }
+}

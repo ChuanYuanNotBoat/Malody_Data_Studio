@@ -1,9 +1,9 @@
-# Malody API 项目上下文文档
+# Malody Data Studio 项目上下文文档
 
 ## 0. 代码文件 Tree
 
 ```text
-malody_api/
+malody-data-studio/
 |-- run.py
 |-- config.py
 |-- selector.py
@@ -73,7 +73,7 @@ malody_api/
 
 ## 1. 项目定位
 
-`malody_api` 是一个围绕 Malody 数据生态构建的本地化数据平台，核心目标是：
+`Malody Data Studio` 是一个围绕 Malody 数据生态构建的本地化数据平台，核心目标是：
 
 - 通过爬虫采集排行榜、玩家资料、谱面/歌曲等数据并落地到 SQLite
 - 通过 FastAPI 提供查询、分析、导出、运维接口

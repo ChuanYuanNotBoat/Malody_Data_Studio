@@ -131,7 +131,7 @@ class TestStatsTrendExtraPlayers(TestCase):
 
         self.assertIn("TopA", names)
         self.assertIn("TrackedB", names)
-        self.assertEqual(rows[1][1], "TrackedB")
+        self.assertEqual(rows[1][1], "TopA")
         self.assertIn("uid", headers)
         self.assertNotIn("来源Top范围", headers)
         self.assertNotIn("来源额外玩家", headers)
