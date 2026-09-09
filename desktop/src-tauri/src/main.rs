@@ -11,6 +11,18 @@ struct BackendState {
     child: Mutex<Option<Child>>,
 }
 
+fn is_project_root(dir: &Path) -> bool {
+    dir.join("app").join("main.py").exists() || dir.join("run.py").exists()
+}
+
+fn find_project_child(dir: &Path) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir() && is_project_root(path))
+}
+
 fn detect_project_root() -> PathBuf {
     if let Ok(v) = std::env::var("MALODY_PROJECT_DIR") {
         return PathBuf::from(v);
@@ -20,14 +32,12 @@ fn detect_project_root() -> PathBuf {
     // Walk up parent directories to find a valid project root.
     let mut cursor = Some(cwd.as_path());
     while let Some(dir) = cursor {
-        if dir.join("app").join("main.py").exists() || dir.join("run.py").exists() {
+        if is_project_root(dir) {
             return dir.to_path_buf();
         }
-        // Also accept repo layouts where package root is nested as "malody_api".
-        if dir.join("malody_api").join("run.py").exists()
-            || dir.join("malody_api").join("app").join("main.py").exists()
-        {
-            return dir.join("malody_api");
+        // Support a checkout nested under an arbitrary local directory name.
+        if let Some(project_root) = find_project_child(dir) {
+            return project_root;
         }
         cursor = dir.parent();
     }

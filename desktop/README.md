@@ -1,4 +1,4 @@
-# Malody Desktop (Tauri + React)
+# Malody Data Studio Desktop (Tauri + React)
 
 ## Development
 1. Install dependencies:

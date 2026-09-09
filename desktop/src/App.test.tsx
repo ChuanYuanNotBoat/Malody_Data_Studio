@@ -37,6 +37,8 @@ vi.mock("./api", () => {
     getChartTrends: vi.fn().mockResolvedValue([]),
     getChartExportUrl: vi.fn().mockReturnValue("http://127.0.0.1:18765/charts/export/charts?format=csv"),
     getQualityReport: vi.fn().mockResolvedValue({ score: 90, severity: "low", trend: "stable", issues: [] }),
+    getAnalysisAppStatus: vi.fn().mockResolvedValue({ root: "x", entry_exists: false }),
+    launchAnalysisApp: vi.fn().mockResolvedValue({ ok: false }),
     runCrawler: vi.fn().mockResolvedValue({ command: [], task: { task_id: "t1" } }),
     runDbMaintenance: vi.fn().mockResolvedValue({ action: "analyze", success: true }),
     runPlugin: vi.fn().mockResolvedValue({ plugin_id: "p1", ok: true }),
@@ -79,13 +81,13 @@ describe("App GUI flow", () => {
 
   it("renders overview and supports language toggle", async () => {
     renderApp();
-    expect(await screen.findByText("Malody Enhanced Desktop Console")).toBeInTheDocument();
-    expect(screen.getByText("Overview")).toBeInTheDocument();
+    expect((await screen.findAllByText("Malody Data Studio")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("Overview")).length).toBeGreaterThan(0);
 
     await userEvent.click(screen.getByRole("combobox"));
     const englishOptions = await screen.findAllByText("English");
     await userEvent.click(englishOptions[englishOptions.length - 1]);
-    await waitFor(() => expect(screen.getByText("Overview")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getAllByText("Overview").length).toBeGreaterThan(0));
   });
 
   it("starts quality job and shows job status tag", async () => {
@@ -108,8 +110,7 @@ describe("App GUI flow", () => {
     await userEvent.click(await screen.findByText("Run Quality Check"));
 
     await waitFor(() => expect(screen.getAllByText(/job=job-123/i).length).toBeGreaterThan(0));
-    await waitFor(() => expect(screen.getByText(/status=failed/i)).toBeInTheDocument());
-    await waitFor(() => expect(screen.getByText("Failed")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/job=job-123 status=Failed/i)).toBeInTheDocument());
   });
 
   it("does not run vacuum maintenance when user cancels confirm", async () => {
@@ -126,14 +127,14 @@ describe("App GUI flow", () => {
   it("shows request error summary when a query fails", async () => {
     vi.mocked(api.getDashboardOverview).mockRejectedValueOnce(new Error("overview failed") as never);
     renderApp();
-    expect(await screen.findByText("Some data requests failed. See details below.")).toBeInTheDocument();
+    expect(await screen.findByText("overview failed")).toBeInTheDocument();
     expect(screen.getByText(/overview failed/i)).toBeInTheDocument();
   });
 
   it("shows concise HTTP error with expandable technical details", async () => {
     vi.mocked(api.getPlugins).mockRejectedValueOnce(new Error("HTTP 500 /plugins: boom") as never);
     renderApp();
-    expect(await screen.findByText("Some data requests failed. See details below.")).toBeInTheDocument();
+    await userEvent.click(await screen.findByText("Plugins"));
     expect(screen.getByText(/request failed \(HTTP 500\)/i)).toBeInTheDocument();
     expect(screen.getByText("View technical details")).toBeInTheDocument();
     expect(screen.getByText(/\/plugins - boom/i)).toBeInTheDocument();

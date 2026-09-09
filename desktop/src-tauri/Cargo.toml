@@ -1,8 +1,8 @@
 [package]
-name = "malody-desktop"
+name = "malody-data-studio-desktop"
 version = "0.1.0"
-description = "Malody Enhanced Desktop Console"
-authors = ["malody-api"]
+description = "Malody Data Studio desktop console"
+authors = ["Malody Data Studio contributors"]
 license = "MIT"
 edition = "2021"
 rust-version = "1.77.2"
