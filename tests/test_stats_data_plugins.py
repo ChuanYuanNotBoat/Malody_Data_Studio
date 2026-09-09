@@ -159,7 +159,8 @@ class TestStatsDataPlugins(TestCase):
                 heat REAL,
                 donate_count INTEGER,
                 last_updated TEXT,
-                mode INTEGER
+                mode INTEGER,
+                server_exists INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE player_rankings (
                 mode INTEGER,
