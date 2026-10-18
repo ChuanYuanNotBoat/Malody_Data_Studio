@@ -97,10 +97,13 @@ class PageParserService:
 
     async def _parse_chart_html(self, html: str, cid: int) -> Dict[str, Any]:
         """解析谱面页面HTML - 专注于排行榜数据"""
-        soup = BeautifulSoup(html, 'html.parser')
+        soup = BeautifulSoup(html, "html.parser")
 
         # 解析基础谱面信息（仅用于上下文）
         chart_info = await self._parse_basic_chart_info(soup, cid)
+
+        if chart_info.get("error"):
+            return {"error": chart_info["error"]}
 
         # 解析排行榜数据（核心功能）
         ranking_data = await self._parse_ranking_data(soup)
@@ -109,36 +112,34 @@ class PageParserService:
             "chart_info": chart_info,
             "ranking": ranking_data,
             "parsed_at": datetime.now().isoformat(),
-            "total_rankings": len(ranking_data)
+            "total_rankings": len(ranking_data),
         }
 
-    async def _parse_basic_chart_info(self, soup, cid: int) -> Dict[str, Any]:
-        """解析基础谱面信息（仅用于上下文）"""
-        song_title_div = soup.find('div', class_='song_title')
-        if not song_title_div:
+    async def _parse_basic_chart_info(self, soup, cid):
+        root = soup.select_one(".song_title")
+        if not root:
             return {"cid": cid, "error": "无法找到谱面信息"}
+        actual = re.search(r"ID\s*:\s*c\s*(\d+)", root.get_text(" ", strip=True))
+        if not actual or int(actual[1]) != int(cid):
+            return {"cid": cid, "error": "谱面ID不匹配"}
+        link = root.select_one('a[href*="/song/"]')
+        match = re.search(r"/song/(\d+)", link.get("href", "")) if link else None
 
-        # 只提取最基础的信息用于上下文
-        right_div = song_title_div.find('div', class_='right')
-        title_h3 = right_div.find('h3', class_='textfix') if right_div else None
-        title_h2 = right_div.find('h2', class_='textfix title') if right_div else None
-
-        title_en = title_h3.get_text(strip=True) if title_h3 else None
-        title_jp = title_h2.get_text(strip=True) if title_h2 else None
-
-        # 提取SID（用于关联数据库）
-        sub_h2 = right_div.find('h2', class_='sub') if right_div else None
-        sid = None
-        if sub_h2:
-            sub_text = sub_h2.get_text()
-            id_match = re.search(r'ID:c?(\d+)', sub_text)
-            sid = int(id_match.group(1)) if id_match else None
+        def title(selector):
+            node = root.select_one(selector)
+            if not node:
+                return None
+            copy = BeautifulSoup(str(node), "html.parser")
+            for item in copy.select(".artist,em"):
+                item.decompose()
+            value = copy.get_text(" ", strip=True)
+            return value[2:] if value.startswith("- ") else value
 
         return {
             "cid": cid,
-            "sid": sid,
-            "title_en": title_en,
-            "title_jp": title_jp
+            "sid": int(match[1]) if match else None,
+            "title_en": title("h3.textfix"),
+            "title_jp": title("h2.title"),
         }
 
     async def _parse_ranking_data(self, soup) -> List[Dict[str, Any]]:
@@ -207,19 +208,19 @@ class PageParserService:
     def _parse_rank(self, item) -> Optional[int]:
         """解析排名 - 支持前3名和后续排名"""
         # 先尝试从 i.label 类中提取前3名
-        rank_label = item.find('i', class_=re.compile(r'label top-\d+'))
+        rank_label = item.find("i", class_=re.compile(r"label top-\d+"))
         if rank_label:
-            class_name = ' '.join(rank_label.get('class', []))
-            rank_match = re.search(r'top-(\d+)', class_name)
+            class_name = " ".join(rank_label.get("class", []))
+            rank_match = re.search(r"top-(\d+)", class_name)
             if rank_match:
                 return int(rank_match.group(1))
 
         # 否则尝试从 span.rank 中提取
-        rank_span = item.find('span', class_='rank')
+        rank_span = item.select_one("i.ranknum") or item.select_one("span.rank")
         if rank_span:
             rank_text = rank_span.get_text(strip=True)
             # 可能包含 # 号，如 "#4"
-            if rank_text.startswith('#'):
+            if rank_text.startswith("#"):
                 rank_text = rank_text[1:]
             try:
                 return int(rank_text)
@@ -248,28 +249,25 @@ class PageParserService:
 
     def _parse_score_info(self, item) -> Dict[str, Any]:
         """解析分数信息"""
-        score_span = item.find('span', class_='score')
-        combo_span = item.find('span', class_='combo')
+        score_span = item.find("span", class_="score")
+        combo_span = item.find("span", class_="combo")
 
         score = None
         combo = None
 
         if score_span and score_span.get_text(strip=True):
             try:
-                score = int(score_span.get_text(strip=True))
+                score = int(score_span.get_text(strip=True).replace(",", ""))
             except ValueError:
                 pass
 
         if combo_span and combo_span.get_text(strip=True):
             try:
-                combo = int(combo_span.get_text(strip=True))
+                combo = int(combo_span.get_text(strip=True).replace(",", ""))
             except ValueError:
                 pass
 
-        return {
-            "score": score,
-            "combo": combo
-        }
+        return {"score": score, "combo": combo}
 
     def _parse_accuracy_info(self, item) -> Dict[str, Any]:
         """解析准确率信息"""
@@ -306,16 +304,20 @@ class PageParserService:
 
     def _parse_mods(self, item) -> List[str]:
         """解析Mods - 使用占位符映射"""
-        mod_span = item.find('span', class_='mod')
+        mod_span = item.find("span", class_="mod")
         if not mod_span:
             return []
 
         mods = []
-        mod_icons = mod_span.find_all('i', class_=re.compile('g_mod'))
+        mod_icons = mod_span.find_all("i", class_=re.compile("g_mod"))
         for icon in mod_icons:
-            mod_class = ' '.join(icon.get('class', []))
+            mod_class = next(
+                (value for value in icon.get("class", []) if value.startswith("g_mod_")), ""
+            )
             # 使用占位符映射
             mod_name = MOD_MAPPING.get(mod_class, mod_class)
+            if mod_name.startswith("mod_"):
+                mod_name = mod_class
             mods.append(mod_name)
 
         return mods

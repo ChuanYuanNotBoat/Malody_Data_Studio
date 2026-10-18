@@ -12,6 +12,18 @@ from malody_api.stats_cli import app as stats_app  # noqa: E402
 
 
 class TestStatsAppCliArgs(TestCase):
+    def test_database_path_honors_environment(self):
+        with patch.dict("os.environ", {"MALODY_DB_PATH": "custom.db"}):
+            self.assertEqual(stats_app._resolve_db_path(), "custom.db")
+
+    def test_database_path_prefers_data_directory_and_falls_back_to_legacy(self):
+        root = Path(stats_app.__file__).resolve().parents[1]
+        with patch.dict("os.environ", {}, clear=True):
+            with patch("malody_api.stats_cli.app.os.path.exists", return_value=True):
+                self.assertEqual(Path(stats_app._resolve_db_path()), root / "data" / "malody_rankings.db")
+            with patch("malody_api.stats_cli.app.os.path.exists", return_value=False):
+                self.assertEqual(Path(stats_app._resolve_db_path()), root / "malody_rankings.db")
+
     def test_main_executes_commands_from_c(self):
         with patch("malody_api.stats_cli.app.os.path.exists", return_value=True), patch(
             "malody_api.stats_cli.app.MalodyViz"

@@ -252,6 +252,17 @@ def get_subseparator(width=None):
         width = get_terminal_width()
     return colorize("-" * min(width, 100), Colors.CYAN)
 
+def _resolve_db_path() -> str:
+    configured_path = os.getenv("MALODY_DB_PATH")
+    if configured_path:
+        return configured_path
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_path = os.path.join(root, "data", "malody_rankings.db")
+    if os.path.exists(data_path):
+        return data_path
+    return os.path.join(root, "malody_rankings.db")
+
+
 class MalodyViz(cmd.Cmd):
     """Malody排行榜数据可视化工具"""
 
@@ -264,7 +275,7 @@ class MalodyViz(cmd.Cmd):
 
     def __init__(self):
         super().__init__()
-        self.db_path = "malody_rankings.db"
+        self.db_path = _resolve_db_path()
         self.conn = None
         self.current_mode = -1  # -1 表示所有模式
         self.output_dir = "viz_output"
@@ -471,9 +482,10 @@ def _execute_commands(shell: "MalodyViz", commands: list[str]) -> int:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    if not os.path.exists("malody_rankings.db"):
-        print(colorize("Error: database file 'malody_rankings.db' not found", Colors.RED))
-        print(colorize("Please place the database file in the project root directory", Colors.YELLOW))
+    db_path = _resolve_db_path()
+    if not os.path.exists(db_path):
+        print(colorize(f"Error: database file '{db_path}' not found", Colors.RED))
+        print(colorize("Please set MALODY_DB_PATH or place the database in data/", Colors.YELLOW))
         return 1
 
     try:

@@ -72,7 +72,7 @@ class HotChart(BaseModel):
     status: int = Field(..., description="状态")
     creator_name: str = Field(..., description="创作者")
     heat: int = Field(..., description="热度")
-    donate_count: int = Field(..., description="打赏数")
+    donate_count: Optional[int] = Field(None, description="打赏数；未采集时为 null")
     deleted: bool = Field(False, description="是否已从服务器删除")
 
 class CreatorStats(BaseModel):

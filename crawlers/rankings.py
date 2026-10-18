@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import gc
 import json
 import logging
@@ -104,6 +104,8 @@ except ImportError:
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+from crawlers.ingestion import atomic, ensure_schema, is_login_page, FetchList, time_text, limit_session
+
 DATA_DIR = os.getenv("MALODY_DATA_DIR", os.path.join(_PROJECT_ROOT, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -196,7 +198,11 @@ HEADERS = {
     "Referer": "https://m.mugzone.net/",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
-    "Accept-Encoding": "gzip, deflate, br",
+    # requests can decode gzip/deflate without optional dependencies.  Do not
+    # advertise Brotli here: the bundled runtime does not include a Brotli
+    # decoder, so an API response encoded as ``br`` reaches ``response.json``
+    # as compressed bytes and raises JSONDecodeError.
+    "Accept-Encoding": "gzip, deflate",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
@@ -355,6 +361,9 @@ class DatabaseManager:
 def _new_api_headers() -> Dict[str, str]:
     return {
         "Accept": "application/json, text/plain, */*",
+        # Keep the API encoding explicit even when the caller's session has
+        # browser-style headers configured.
+        "Accept-Encoding": "gzip, deflate",
         "Origin": "https://malody.mugzone.net",
         "Referer": "https://malody.mugzone.net/",
         "User-Agent": HEADERS["User-Agent"],
@@ -443,23 +452,59 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _acquire_mm_run_lock() -> bool:
+def _acquire_mm_run_lock():
+    """OS ownership survives PID reuse and is released automatically on crash."""
+    global _mm_lock_handle
+    if globals().get("_mm_lock_handle") is not None:
+        return False
     os.makedirs(os.path.dirname(MM_RUN_LOCK_FILE), exist_ok=True)
+    handle = os.fdopen(os.open(MM_RUN_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
     try:
-        fd = os.open(MM_RUN_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(f"{os.getpid()}\n{datetime.now().isoformat()}\n")
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(handle.fileno()).st_size == 0:
+                handle.write(b" ")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.write(b" ")
+        handle.seek(1)
+        handle.truncate()
+        handle.write(
+            json.dumps(
+                {"pid": os.getpid(), "started_at": datetime.now().isoformat()}
+            ).encode()
+        )
+        handle.flush()
+        _mm_lock_handle = handle
         return True
-    except FileExistsError:
+    except (OSError, BlockingIOError):
+        handle.close()
         return False
 
 
 def _release_mm_run_lock():
-    try:
-        if os.path.exists(MM_RUN_LOCK_FILE):
-            os.remove(MM_RUN_LOCK_FILE)
-    except OSError:
-        logger.warning("failed to remove mm run lock: %s", MM_RUN_LOCK_FILE)
+    global _mm_lock_handle
+    handle = globals().get("_mm_lock_handle")
+    if handle is not None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+        _mm_lock_handle = None
 
 
 def ensure_mm_schema(cursor: sqlite3.Cursor):
@@ -608,7 +653,7 @@ def init_database():
     db_manager = DatabaseManager()
     cursor = db_manager.get_connection().cursor()
     try:
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS player_identity (
             player_id INTEGER PRIMARY KEY AUTOINCREMENT,
             uid TEXT,
@@ -616,9 +661,9 @@ def init_database():
             first_seen TIMESTAMP NOT NULL,
             last_seen TIMESTAMP NOT NULL
         )
-        ''')
+        """)
 
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS player_aliases (
             alias_id INTEGER PRIMARY KEY AUTOINCREMENT,
             player_id INTEGER NOT NULL,
@@ -628,9 +673,9 @@ def init_database():
             last_seen TIMESTAMP NOT NULL,
             FOREIGN KEY (player_id) REFERENCES player_identity (player_id)
         )
-        ''')
+        """)
 
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS player_rankings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             player_id INTEGER,
@@ -646,16 +691,16 @@ def init_database():
             crawl_time TIMESTAMP NOT NULL,
             FOREIGN KEY (player_id) REFERENCES player_identity (player_id)
         )
-        ''')
+        """)
 
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS import_metadata (
             mode INTEGER PRIMARY KEY,
             last_import_time TIMESTAMP
         )
-        ''')
+        """)
 
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS player_config (
             config_id INTEGER PRIMARY KEY AUTOINCREMENT,
             player_identifier TEXT NOT NULL UNIQUE,
@@ -666,9 +711,9 @@ def init_database():
             created_time TIMESTAMP NOT NULL,
             last_updated TIMESTAMP NOT NULL
         )
-        ''')
+        """)
 
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS player_crawl_status (
             player_identifier TEXT PRIMARY KEY,
             last_crawled TIMESTAMP,
@@ -676,20 +721,36 @@ def init_database():
             success_count INTEGER DEFAULT 0,
             last_error TEXT
         )
-        ''')
+        """)
 
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)')
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_player_identity_uid ON player_identity(uid)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_player_aliases_uid ON player_aliases(uid)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_player_rankings_uid ON player_rankings(uid)"
+        )
         ensure_mm_schema(cursor)
 
         # Initialize import metadata rows.
         for mode in MODES:
             cursor.execute(
                 "INSERT OR IGNORE INTO import_metadata (mode, last_import_time) VALUES (?, NULL)",
-                (mode,)
+                (mode,),
             )
 
+        ensure_schema(db_manager.get_connection())
+        for column in ("uid", "current_name"):
+            where = " WHERE uid IS NOT NULL AND uid!=''" if column == "uid" else ""
+            if not cursor.execute(
+                f"SELECT {column} FROM player_identity{where} GROUP BY {column} HAVING COUNT(*)>1 LIMIT 1"
+            ).fetchone():
+                cursor.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS uq_identity_{column} ON player_identity({column})"
+                    + where
+                )
         db_manager.get_connection().commit()
         logger.info("数据库初始化完成")
         migrate_database()  # 尝试添加 uid 字段（若已存在则跳过）
@@ -699,397 +760,216 @@ def init_database():
 
 
 def resolve_player_identity(name, crawl_time, uid=None):
-    """
-    解析玩家身份，优先使用 uid，处理改名情况。
-    返回 player_id。
-    """
-    db_manager = DatabaseManager()
-    cursor = db_manager.get_connection().cursor()
+    """Match stable UID and unique current name; aliases never reassign a UID."""
+    if not name or not str(name).strip():
+        return None
+    name = str(name).strip()
+    uid = str(uid).strip() if uid is not None else None
+    conn = DatabaseManager().get_connection()
     try:
-        player_id = None
-        # Prefer uid-based lookup first.
-        if uid:
-            try:
+        with atomic(conn):
+            cursor = conn.cursor()
+            rows = (
                 cursor.execute(
-                    "SELECT player_id FROM player_identity WHERE uid = ?",
-                    (uid,)
-                )
-                result = cursor.fetchone()
-                if result:
-                    player_id = result[0]
-                    # Refresh last-seen timestamp and current display name.
-                    cursor.execute(
-                        "UPDATE player_identity SET last_seen = ?, current_name = ? WHERE player_id = ?",
-                        (crawl_time, name, player_id)
-                    )
-                    # Insert alias record when missing.
-                    cursor.execute(
-                        "SELECT alias_id FROM player_aliases WHERE player_id = ? AND alias = ?",
-                        (player_id, name)
-                    )
-                    if not cursor.fetchone():
-                        cursor.execute(
-                            "INSERT INTO player_aliases (player_id, uid, alias, first_seen, last_seen) VALUES (?, ?, ?, ?, ?)",
-                            (player_id, uid, name, crawl_time, crawl_time)
-                        )
-                    else:
-                        cursor.execute(
-                            "UPDATE player_aliases SET last_seen = ? WHERE player_id = ? AND alias = ?",
-                            (crawl_time, player_id, name)
-                        )
-            except sqlite3.OperationalError as e:
-                if "no such column: uid" in str(e):
-                    logger.warning("uid 列不存在，回退到名称查找")
-                else:
-                    raise
-
-        # If uid lookup misses, fall back to alias lookup.
-        if not player_id:
-            cursor.execute(
-                "SELECT player_id FROM player_aliases WHERE alias = ?",
-                (name,)
+                    "SELECT player_id,uid,current_name,last_seen FROM player_identity WHERE uid=?",
+                    (uid,),
+                ).fetchall()
+                if uid
+                else []
             )
-            result = cursor.fetchone()
-            if result:
-                player_id = result[0]
-                # If uid is available, backfill uid into identity/alias tables.
-                if uid:
-                    try:
-                        cursor.execute(
-                            "UPDATE player_identity SET uid = ? WHERE player_id = ?",
-                            (uid, player_id)
-                        )
-                        cursor.execute(
-                            "UPDATE player_aliases SET uid = ? WHERE player_id = ?",
-                            (uid, player_id)
-                        )
-                    except sqlite3.OperationalError as e:
-                        if "no such column: uid" in str(e):
-                            logger.warning("uid 列不存在，跳过 uid 更新")
-                        else:
-                            raise
+            if len(rows) > 1:
+                raise ValueError("Duplicate UID; identity requires reconciliation")
+            names = cursor.execute(
+                "SELECT player_id,uid FROM player_identity WHERE current_name=?",
+                (name,),
+            ).fetchall()
+            if rows:
+                player_id, _, _, last_seen = rows[0]
+                if any(
+                    row[0] != player_id and row[1] not in (None, "", uid)
+                    for row in names
+                ):
+                    raise ValueError(
+                        "Current name belongs to another UID; refusing identity overwrite"
+                    )
+                if last_seen and time_text(crawl_time) < time_text(last_seen):
+                    return player_id
+            else:
+                if len(names) > 1:
+                    raise ValueError("Ambiguous current name")
+                if names:
+                    player_id, known_uid = names[0]
+                    if uid and known_uid not in (None, "", uid):
+                        raise ValueError("Current name conflicts with a different UID")
+                    uid = uid or known_uid
+                else:
+                    cursor.execute(
+                        "INSERT INTO player_identity(uid,current_name,first_seen,last_seen) VALUES(?,?,?,?)",
+                        (uid, name, crawl_time, crawl_time),
+                    )
+                    player_id = cursor.lastrowid
+            cursor.execute(
+                "UPDATE player_identity SET uid=COALESCE(?,uid),current_name=?,last_seen=? WHERE player_id=?",
+                (uid, name, crawl_time, player_id),
+            )
+            alias = cursor.execute(
+                "SELECT alias_id FROM player_aliases WHERE player_id=? AND alias=?",
+                (player_id, name),
+            ).fetchone()
+            if alias:
                 cursor.execute(
-                    "UPDATE player_aliases SET last_seen = ? WHERE alias = ?",
-                    (crawl_time, name)
-                )
-                cursor.execute(
-                    "UPDATE player_identity SET last_seen = ?, current_name = ? WHERE player_id = ?",
-                    (crawl_time, name, player_id)
+                    "UPDATE player_aliases SET uid=COALESCE(?,uid),last_seen=? WHERE player_id=? AND alias=?",
+                    (uid, crawl_time, player_id, name),
                 )
             else:
-                # Create a brand-new player identity.
                 cursor.execute(
-                    "INSERT INTO player_identity (uid, current_name, first_seen, last_seen) VALUES (?, ?, ?, ?)",
-                    (uid, name, crawl_time, crawl_time)
+                    "INSERT INTO player_aliases(player_id,uid,alias,first_seen,last_seen) VALUES(?,?,?,?,?)",
+                    (player_id, uid, name, crawl_time, crawl_time),
                 )
-                player_id = cursor.lastrowid
-                cursor.execute(
-                    "INSERT INTO player_aliases (player_id, uid, alias, first_seen, last_seen) VALUES (?, ?, ?, ?, ?)",
-                    (player_id, uid, name, crawl_time, crawl_time)
-                )
-        db_manager.get_connection().commit()
         return player_id
-    except Exception as e:
-        logger.error("解析玩家身份失败: %s", e)
-        db_manager.get_connection().rollback()
+    except (sqlite3.Error, ValueError) as exc:
+        logger.error("Identity resolution failed for UID %s: %s", uid, exc)
         return None
 
 
 def link_player_aliases(original_name, new_name, change_time):
-    """Manually link two names for one player (rename handling)."""
-    db_manager = DatabaseManager()
-    cursor = db_manager.get_connection().cursor()
-    try:
-        cursor.execute(
-            "SELECT player_id FROM player_aliases WHERE alias = ?",
-            (original_name,)
-        )
-        result = cursor.fetchone()
-        if not result:
-            logger.error("找不到原始名字: %s", original_name)
+    conn = DatabaseManager().get_connection()
+    with atomic(conn):
+        rows = conn.execute(
+            "SELECT DISTINCT i.player_id,i.uid FROM player_identity i LEFT JOIN player_aliases a ON a.player_id=i.player_id WHERE i.current_name=? OR a.alias=?",
+            (original_name, original_name),
+        ).fetchall()
+        if len(rows) != 1:
             return False
-        player_id = result[0]
-
-        cursor.execute(
-            "SELECT player_id FROM player_aliases WHERE alias = ?",
-            (new_name,)
+        player_id, uid = rows[0]
+        if conn.execute(
+            "SELECT 1 FROM player_identity WHERE current_name=? AND player_id!=?",
+            (new_name, player_id),
+        ).fetchone():
+            return False
+        if uid:
+            return resolve_player_identity(new_name, change_time, uid) == player_id
+        conn.execute(
+            "UPDATE player_identity SET current_name=?,last_seen=? WHERE player_id=?",
+            (new_name, change_time, player_id),
         )
-        result = cursor.fetchone()
-        if result:
-            # New name belongs to another player_id; merge required.
-            old_player_id = result[0]
-            cursor.execute(
-                "UPDATE player_rankings SET player_id = ? WHERE player_id = ?",
-                (player_id, old_player_id)
+        if not conn.execute(
+            "SELECT 1 FROM player_aliases WHERE player_id=? AND alias=?",
+            (player_id, new_name),
+        ).fetchone():
+            conn.execute(
+                "INSERT INTO player_aliases(player_id,alias,first_seen,last_seen) VALUES(?,?,?,?)",
+                (player_id, new_name, change_time, change_time),
             )
-            cursor.execute(
-                "UPDATE player_aliases SET player_id = ? WHERE player_id = ?",
-                (player_id, old_player_id)
-            )
-            cursor.execute(
-                "DELETE FROM player_identity WHERE player_id = ?",
-                (old_player_id,)
-            )
-        else:
-            # New name has not appeared before; add alias directly.
-            cursor.execute(
-                "INSERT INTO player_aliases (player_id, alias, first_seen, last_seen) VALUES (?, ?, ?, ?)",
-                (player_id, new_name, change_time, change_time)
-            )
-        cursor.execute(
-            "UPDATE player_identity SET current_name = ? WHERE player_id = ?",
-            (new_name, player_id)
-        )
-        db_manager.get_connection().commit()
-        logger.info("成功关联玩家改名: %s -> %s", original_name, new_name)
         return True
-    except Exception as e:
-        logger.error("处理玩家改名失败: %s", e)
-        db_manager.get_connection().rollback()
-        return False
 
 
 def parse_player_list(html):
-    """Parse leaderboard page and return player rows (with player ID)."""
     soup = BeautifulSoup(html, "html.parser")
-    players = []
+    rows = FetchList(complete=True)
 
-    # Handle top 3 entries (item-top).
-    top_items = soup.select("div.item-top")
-    for item in top_items:
-        label_tag = item.select_one("i.label")
-        rank = None
-        if label_tag and label_tag.has_attr("class"):
-            for c in label_tag["class"]:
-                if c.startswith("top-"):
-                    rank = c.replace("top-", "")
-                    break
+    def number(node, integer=True):
+        if node is None:
+            return None
+        match = re.search(r"[0-9][0-9,]*(?:\.[0-9]+)?", node.get_text(" ", strip=True))
+        if not match:
+            return None
+        return (int if integer else float)(match[0].replace(",", ""))
 
-        name_tag = item.select_one("span.name a")
-        lv_tag = item.select_one("span.lv")
-        acc_tag = item.select_one("span.acc")
-        combo_tag = item.select_one("span.combo")
-        pc_tag = item.select_one("span.pc, span[class*=pc]")
-
-        player_id = None
-        if name_tag and name_tag.has_attr('href'):
-            href = name_tag['href']
-            match = re.search(r'/accounts/user/(\d+)', href)
+    for item in soup.select("div.item-top,div.item"):
+        top = item.select_one("i.label")
+        rank = (
+            next(
+                (
+                    int(value[4:])
+                    for value in top.get("class", [])
+                    if value.startswith("top-") and value[4:].isdigit()
+                ),
+                None,
+            )
+            if top
+            else number(item.select_one("span.rank"))
+        )
+        link = item.select_one("span.name a")
+        uid = re.search(r"/accounts/user/(\d+)", link.get("href", "")) if link else None
+        if not rank or not uid or not link.get_text(strip=True):
+            rows.complete = False
+            rows.error = "invalid_row"
+            continue
+        level = item.select_one("span.lv")
+        exp = number(item.select_one("span.exp"))
+        if exp is None and level:
+            match = re.search(r"-\s*([0-9,]+)", level.get_text())
             if match:
-                player_id = match.group(1)
-
-        level = None
-        exp = None
-        if lv_tag:
-            lv_text = lv_tag.text.strip()
-            if '-' in lv_text:
-                parts = lv_text.split('-')
-                level = parts[0].replace("Lv.", "").strip()
-                exp = parts[1].strip()
-            else:
-                level = lv_text.replace("Lv.", "").strip()
-
-        acc_text = None
-        if acc_tag:
-            acc_text = acc_tag.text.replace("Acc:", "").replace("%", "").strip()
-
-        combo_text = None
-        if combo_tag:
-            combo_text = combo_tag.text.replace("Combo:", "").strip()
-
-        playcount = None
-        if pc_tag:
-            # Keep this parser prefix-agnostic to avoid locale/encoding regressions.
-            pc_text = pc_tag.text.strip()
-            digits = ''.join(filter(str.isdigit, pc_text))
-            if digits:
-                playcount = int(digits)
-
-        players.append({
+                exp = int(match[1].replace(",", ""))
+        row = {
             "rank": rank,
-            "name": name_tag.text.strip() if name_tag else None,
-            "player_id": player_id,
-            "lv": level,
+            "name": link.get_text(strip=True),
+            "player_id": uid[1],
+            "lv": number(level),
             "exp": exp,
-            "acc": acc_text,
-            "combo": combo_text,
-            "pc": playcount
-        })
-
-    # Handle rank 4+ entries (div.item).
-    list_items = soup.select("div.item")
-    for item in list_items:
-        rank_tag = item.select_one("span.rank")
-        rank = rank_tag.text.strip() if rank_tag else None
-
-        name_tag = item.select_one("span.name a")
-        lv_tag = item.select_one("span.lv")
-        exp_tag = item.select_one("span.exp")
-        acc_tag = item.select_one("span.acc")
-        pc_tag = item.select_one("span.pc, span[class*=pc]")
-        combo_tag = item.select_one("span.combo")
-
-        player_id = None
-        if name_tag and name_tag.has_attr('href'):
-            href = name_tag['href']
-            match = re.search(r'/accounts/user/(\d+)', href)
-            if match:
-                player_id = match.group(1)
-
-        acc_text = None
-        if acc_tag:
-            acc_text = acc_tag.text.replace("%", "").strip()
-
-        playcount = None
-        if pc_tag:
-            pc_text = pc_tag.text.strip()
-            digits = ''.join(filter(str.isdigit, pc_text))
-            if digits:
-                playcount = int(digits)
-
-        players.append({
-            "rank": rank,
-            "name": name_tag.text.strip() if name_tag else None,
-            "player_id": player_id,
-            "lv": lv_tag.text.strip() if lv_tag else None,
-            "exp": exp_tag.text.strip() if exp_tag else None,
-            "acc": acc_text,
-            "combo": combo_tag.text.strip() if combo_tag else None,
-            "pc": playcount
-        })
-
-    # Type conversion and data cleanup.
-    processed_players = []
-    for p in players:
-        try:
-            rank = int(p["rank"]) if p["rank"] else None
-        except:
-            rank = None
-        try:
-            lv = int(p["lv"]) if p["lv"] else 0
-        except:
-            lv = 0
-        try:
-            exp = int(p["exp"]) if p["exp"] else 0
-        except:
-            exp = 0
-        try:
-            acc = float(p["acc"]) if p["acc"] else 0.0
-        except:
-            acc = 0.0
-        try:
-            combo = int(p["combo"]) if p["combo"] else 0
-        except:
-            combo = 0
-        pc = p["pc"] if p["pc"] is not None else 0
-
-        if rank is not None:
-            processed_players.append({
-                "rank": rank,
-                "name": p["name"],
-                "player_id": p["player_id"],
-                "lv": lv,
-                "exp": exp,
-                "acc": acc,
-                "combo": combo,
-                "pc": pc
-            })
-    return processed_players
+            "acc": number(item.select_one("span.acc"), False),
+            "combo": number(item.select_one("span.combo")),
+            "pc": number(item.select_one("span.pc,span[class*=pc]")),
+        }
+        if any(row[k] is None for k in ("lv", "exp", "acc", "combo", "pc")):
+            rows.complete = False
+            rows.error = "partial_stats"
+        rows.append(row)
+    return rows
 
 
 def parse_player_profile(html, player_id):
-    """Parse player profile page and return rankings for all modes."""
     soup = BeautifulSoup(html, "html.parser")
-    player_data = []
-
-    name_tag = soup.select_one("div.user_head .name span")
-    player_name = name_tag.text.strip() if name_tag else f"玩家_{player_id}"
-
-    rank_items = soup.select("div.rank .item")
-    for item in rank_items:
-        try:
-            img_tag = item.select_one("img")
-            if not img_tag or not img_tag.has_attr('src'):
-                continue
-            src = img_tag['src']
-            mode = None
-            if 'mode-0.png' in src:
-                mode = 0
-            elif 'mode-1.png' in src:
-                mode = 1
-            elif 'mode-2.png' in src:
-                mode = 2
-            elif 'mode-3.png' in src:
-                mode = 3
-            elif 'mode-4.png' in src:
-                mode = 4
-            elif 'mode-5.png' in src:
-                mode = 5
-            elif 'mode-6.png' in src:
-                mode = 6
-            elif 'mode-7.png' in src:
-                mode = 7
-            elif 'mode-8.png' in src:
-                mode = 8
-            elif 'mode-9.png' in src:
-                mode = 9
-            else:
-                continue
-
-            rank_tag = item.select_one("p.rank")
-            if not rank_tag:
-                continue
-            rank_text = rank_tag.text.strip()
-            if rank_text.startswith('#'):
-                try:
-                    rank = int(rank_text[1:].replace(',', ''))
-                except:
-                    continue
-            else:
-                continue
-
-            data_spans = item.select("p span")
-            exp = 0
-            playcount = 0
-            acc = 0.0
-            combo = 0
-            for span in data_spans:
-                text = span.text.strip()
-                if text.startswith('Exp.'):
-                    try:
-                        exp = int(text.replace('Exp.', '').strip().replace(',', ''))
-                    except:
-                        pass
-                elif text.startswith('Playcount:'):
-                    try:
-                        playcount = int(text.replace('Playcount:', '').strip())
-                    except:
-                        pass
-                elif text.startswith('Acc.'):
-                    try:
-                        acc = float(text.replace('Acc.', '').replace('%', '').strip())
-                    except:
-                        pass
-                elif text.startswith('Combo:'):
-                    try:
-                        combo = int(text.replace('Combo:', '').strip())
-                    except:
-                        pass
-
-            player_data.append({
-                "rank": rank,
-                "name": player_name,
-                "lv": 0,
-                "exp": exp,
-                "acc": acc,
-                "combo": combo,
-                "pc": playcount,
-                "mode": mode
-            })
-        except Exception as e:
-            logger.warning("解析玩家 %s 模式 %s 数据时出错: %s", player_id, mode, e)
+    name = soup.select_one("div.user_head .name span")
+    if not name or is_login_page(html):
+        return FetchList(error="invalid_profile")
+    rows = []
+    valid = True
+    for item in soup.select("div.rank .item"):
+        icon = item.select_one('img[src*="mode-"]')
+        rank_node = item.select_one("p.rank")
+        mode_match = re.search(r"mode-(\d+)\.", icon.get("src", "")) if icon else None
+        rank_match = (
+            re.search(r"#([\d,]+)", rank_node.get_text()) if rank_node else None
+        )
+        if not mode_match or not rank_match:
+            valid = False
             continue
-    return player_data
+        row = {
+            "mode": int(mode_match[1]),
+            "rank": int(rank_match[1].replace(",", "")),
+            "name": name.get_text(strip=True),
+            "lv": None,
+            "exp": None,
+            "pc": None,
+            "acc": None,
+            "combo": None,
+        }
+        for node in item.select("p span"):
+            text = node.get_text(" ", strip=True)
+            for label, field, convert in (
+                ("Exp.", "exp", int),
+                ("Playcount:", "pc", int),
+                ("Acc.", "acc", float),
+                ("Combo:", "combo", int),
+            ):
+                if text.startswith(label):
+                    try:
+                        row[field] = convert(
+                            text[len(label) :].replace(",", "").replace("%", "").strip()
+                        )
+                    except ValueError:
+                        valid = False
+        if any(row[field] is None for field in ("exp", "pc", "acc", "combo")):
+            valid = False
+        else:
+            rows.append(row)
+    return FetchList(
+        rows,
+        complete=valid and bool(soup.select_one("div.rank")),
+        error=None if valid else "partial_ranks",
+    )
 
 
 def crawl_player_profile(session, player_identifier):
@@ -1121,24 +1001,58 @@ def get_excel_filename(mode):
         return os.path.join(DATA_DIR, f"mode{mode}.xlsx")
 
 
-def crawl_mode_player(session, mode):
-    """Fetch one mode leaderboard and return a DataFrame."""
-    url = BASE_URL.format(mode=mode)
+def crawl_mode_player(session, mode, limit=DEFAULT_MM_LIMIT):
+    players = []
+    complete = False
+    error = None
     try:
-        resp = session.get(url, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logger.error("模式 %d 请求失败: %s", mode, e)
-        notify_user("排行榜爬取异常", f"模式 {mode} 请求失败: {e}", "error")
-        return pd.DataFrame()
-
-    players = parse_player_list(resp.text)
-    df = pd.DataFrame(players)
-    if not df.empty:
-        df = df[df['rank'].notnull()]
-        df['rank'] = df['rank'].astype(int)
-        df = df.sort_values('rank').reset_index(drop=True)
-    return df
+        response = session.get(BASE_URL.format(mode=mode), timeout=30)
+        response.raise_for_status()
+        if is_login_page(response.text, getattr(response, "url", "")):
+            raise RuntimeError("Leaderboard authentication expired")
+        batch = parse_player_list(response.text)
+        if (
+            not BeautifulSoup(response.text, "html.parser").select_one(
+                ".all_chart .list"
+            )
+            and not batch
+        ):
+            raise RuntimeError("Missing leaderboard structure")
+        for row in batch:
+            row["source"] = "page_leaderboard"
+            players.append(row)
+        # The legacy HTML endpoint ignores from=50 and repeats its Top 50.
+        # Continue through the official API's verified hasMore/next contract.
+        if limit is None or len(players) < limit:
+            continuation = fetch_global_mode(session, mode, limit=limit, mm=0)
+            seen = {row["player_id"] for row in players}
+            for item in continuation:
+                if str(item["uid"]) in seen:
+                    continue
+                seen.add(str(item["uid"]))
+                players.append(
+                    {
+                        "rank": item["rank"],
+                        "name": item["username"],
+                        "player_id": str(item["uid"]),
+                        "lv": item.get("level"),
+                        "exp": item.get("value"),
+                        "acc": item.get("acc"),
+                        "combo": item.get("combo"),
+                        "pc": item.get("playcount"),
+                        "source": "newapi_ranking_global",
+                    }
+                )
+            complete = continuation.complete and batch.complete
+            error = continuation.error or batch.error
+    except (requests.RequestException, RuntimeError) as exc:
+        error = str(exc)
+        logger.warning("Ranking mode %s incomplete: %s", mode, exc)
+    frame = pd.DataFrame(players[:limit] if limit is not None else players)
+    frame.attrs.update(
+        source="page_leaderboard", complete=complete, error=error, requested_limit=limit
+    )
+    return frame
 
 
 def save_data_to_excel(mode, df, timestamp):
@@ -1187,93 +1101,92 @@ def save_data_to_excel(mode, df, timestamp):
         logger.exception("保存模式 %d 数据到Excel失败", mode)
 
 
-def save_player_ranking_record(player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time, source):
-    """
-    区间模型排行榜保存（统一处理所有来源）。
-    返回值：
-        'new'          : 首次插入
-        'diff_insert'  : 状态变化，插入新 start
-        'update'       : 延长 end
-        'same_insert'  : 插入 end
-        'update_fill'  : 填充 lv
-    """
-    db_manager = DatabaseManager()
-    conn = db_manager.get_connection()
-    cursor = conn.cursor()
+def save_player_ranking_record(
+    player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time, source
+):
+    """Keep interval boundaries, comparing common precision across sources."""
+    conn = DatabaseManager().get_connection()
+    lv, exp, acc, combo, pc = (
+        None if pd.isna(value) else value for value in (lv, exp, acc, combo, pc)
+    )
+    with atomic(conn):
+        ensure_schema(conn)
+        rows = conn.execute(
+            "SELECT id,rank,name,lv,exp,acc,combo,pc,crawl_time,source FROM player_rankings WHERE player_id=? AND mode=? ORDER BY crawl_time DESC,id DESC LIMIT 2",
+            (player_id, mode),
+        ).fetchall()
 
-    current_core = (rank, name, exp, acc, combo, pc)
+        coarse = source.startswith("page") or (
+            rows and str(rows[0][9] or "").startswith("page")
+        )
 
-    # Load only the latest two rows for interval-state comparison.
-    cursor.execute('''
-        SELECT id, rank, name, lv, exp, acc, combo, pc, crawl_time
-        FROM player_rankings
-        WHERE player_id = ? AND mode = ?
-        ORDER BY crawl_time DESC
-        LIMIT 2
-    ''', (player_id, mode))
+        def accuracy(value):
+            value = float(value or 0)
+            return round(value, 2) if coarse else value
 
-    rows = cursor.fetchall()
+        def core(row):
+            return (
+                row[1],
+                row[2],
+                row[4],
+                accuracy(row[5]),
+                row[6],
+                row[7],
+            )
 
-    # No history yet -> insert the first start record.
-    if not rows:
-        cursor.execute('''
-            INSERT INTO player_rankings
-            (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
-        conn.commit()
-        return 'new'
-
-    # Latest stored record.
-    last = rows[0]
-    last_id, last_rank, last_name, last_lv, last_exp, last_acc, last_combo, last_pc, last_time = last
-    last_core = (last_rank, last_name, last_exp, last_acc, last_combo, last_pc)
-
-    # Determine whether an end marker already exists (latest two rows equal).
-    has_two_same = False
-    if len(rows) == 2:
-        second = rows[1]
-        second_core = (second[1], second[2], second[4], second[5], second[6], second[7])
-        if second_core == last_core:
-            has_two_same = True
-
-    # Current core fields are identical to latest state.
-    if last_core == current_core:
-        # Guard against legacy/source bug: lv may temporarily bounce to 0 even when
-        # other core fields are unchanged. Keep the known non-zero lv in this case.
-        if last_lv and last_lv > 0 and (lv is None or lv == 0):
-            lv = last_lv
-
-        # Backfill lv only when previous lv is missing (0).
-        if last_lv == 0 and lv != 0:
-            cursor.execute('UPDATE player_rankings SET lv = ?, crawl_time = ? WHERE id = ?', (lv, crawl_time, last_id))
-            conn.commit()
-            return 'update_fill'
-
-        if not has_two_same:
-            # Insert a new end record for unchanged status.
-            cursor.execute('''
-                INSERT INTO player_rankings
-                (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
-            conn.commit()
-            return 'same_insert'
-        else:
-            # Extend end by updating latest crawl_time only.
-            cursor.execute('UPDATE player_rankings SET crawl_time = ? WHERE id = ?', (crawl_time, last_id))
-            conn.commit()
-            return 'update'
-
-    # State changed -> start a new interval segment.
-    cursor.execute('''
-        INSERT INTO player_rankings
-        (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (player_id, uid, mode, rank, name, lv, exp, acc, combo, pc, crawl_time))
-
-    conn.commit()
-    return 'diff_insert'
+        operation = "new"
+        if rows:
+            last = rows[0]
+            if time_text(crawl_time) < time_text(last[8]):
+                return "update"
+            lv = last[3] if lv in (None, 0) and last[3] not in (None, 0) else lv
+            exp = last[4] if exp is None else exp
+            acc = last[5] if acc is None else acc
+            combo = last[6] if combo is None else combo
+            pc = last[7] if pc is None else pc
+            current = (rank, name, exp, accuracy(acc), combo, pc)
+            if time_text(crawl_time) == time_text(last[8]) and current == core(last):
+                return "update"
+            if current == core(last):
+                # A coarser source must not erase a more precise observation.
+                acc = (
+                    last[5]
+                    if len(str(acc).split(".")[-1]) < len(str(last[5]).split(".")[-1])
+                    else acc
+                )
+                if last[3] in (None, 0) and lv not in (None, 0):
+                    conn.execute(
+                        "UPDATE player_rankings SET lv=?,acc=?,crawl_time=?,source=? WHERE id=?",
+                        (lv, acc, crawl_time, source, last[0]),
+                    )
+                    return "update_fill"
+                if len(rows) == 2 and core(rows[1]) == core(last):
+                    conn.execute(
+                        "UPDATE player_rankings SET acc=?,crawl_time=?,source=? WHERE id=?",
+                        (acc, crawl_time, source, last[0]),
+                    )
+                    return "update"
+                operation = "same_insert"
+            else:
+                operation = "diff_insert"
+        conn.execute(
+            "INSERT INTO player_rankings(player_id,uid,mode,rank,name,lv,exp,acc,combo,pc,crawl_time,source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                player_id,
+                uid,
+                mode,
+                rank,
+                name,
+                lv,
+                exp,
+                acc,
+                combo,
+                pc,
+                crawl_time,
+                source,
+            ),
+        )
+        return operation
 
 
 def save_player_ranking_mm_record(
@@ -1290,73 +1203,133 @@ def save_player_ranking_mm_record(
     crawl_time: datetime,
     source: str,
 ) -> str:
-    """
-    MM 排行区间模型保存。
-    """
-    db_manager = DatabaseManager()
-    conn = db_manager.get_connection()
-    cursor = conn.cursor()
-
-    current_core = (rank, name, mm_value, lv, acc, combo, pc)
-    cursor.execute(
+    with atomic(DatabaseManager().get_connection()):
         """
-        SELECT id, rank, name, mm_value, lv, acc, combo, pc, crawl_time
-        FROM player_rankings_mm
-        WHERE player_id = ? AND mode = ?
-        ORDER BY crawl_time DESC
-        LIMIT 2
-        """,
-        (player_id, mode),
-    )
-    rows = cursor.fetchall()
+        MM 排行区间模型保存。
+        """
+        db_manager = DatabaseManager()
+        conn = db_manager.get_connection()
+        cursor = conn.cursor()
 
-    if not rows:
+        current_core = (rank, name, mm_value, lv, acc, combo, pc)
         cursor.execute(
             """
-            INSERT INTO player_rankings_mm
-            (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT id, rank, name, mm_value, lv, acc, combo, pc, crawl_time
+            FROM player_rankings_mm
+            WHERE player_id = ? AND mode = ?
+            ORDER BY crawl_time DESC
+            LIMIT 2
             """,
-            (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source),
+            (player_id, mode),
         )
-        conn.commit()
-        return "new"
+        rows = cursor.fetchall()
 
-    last = rows[0]
-    last_id = last[0]
-    last_core = (last[1], last[2], last[3], last[4], last[5], last[6], last[7])
-    has_two_same = False
-    if len(rows) == 2:
-        second = rows[1]
-        second_core = (second[1], second[2], second[3], second[4], second[5], second[6], second[7])
-        has_two_same = second_core == last_core
-
-    if last_core == current_core:
-        if not has_two_same:
+        if not rows:
             cursor.execute(
                 """
                 INSERT INTO player_rankings_mm
                 (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source),
+                (
+                    player_id,
+                    uid,
+                    mode,
+                    rank,
+                    name,
+                    mm_value,
+                    lv,
+                    acc,
+                    combo,
+                    pc,
+                    crawl_time,
+                    source,
+                ),
             )
-            conn.commit()
-            return "same_insert"
-        cursor.execute("UPDATE player_rankings_mm SET crawl_time = ? WHERE id = ?", (crawl_time, last_id))
-        conn.commit()
-        return "update"
+            # The caller owns the surrounding transaction.
+            return "new"
 
-    cursor.execute(
-        """
-        INSERT INTO player_rankings_mm
-        (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source),
-    )
-    conn.commit()
-    return "diff_insert"
+        last = rows[0]
+        if time_text(crawl_time) < time_text(last[8]):
+            return "update"
+        lv = last[4] if lv in (None, 0) and last[4] not in (None, 0) else lv
+        acc = last[5] if acc is None else acc
+        combo = last[6] if combo is None else combo
+        pc = last[7] if pc is None else pc
+        current_core = (rank, name, mm_value, lv, acc, combo, pc)
+        last_id = last[0]
+        last_core = (last[1], last[2], last[3], last[4], last[5], last[6], last[7])
+        if time_text(crawl_time) == time_text(last[8]) and last_core == current_core:
+            return "update"
+        has_two_same = False
+        if len(rows) == 2:
+            second = rows[1]
+            second_core = (
+                second[1],
+                second[2],
+                second[3],
+                second[4],
+                second[5],
+                second[6],
+                second[7],
+            )
+            has_two_same = second_core == last_core
+
+        if last_core == current_core:
+            if not has_two_same:
+                cursor.execute(
+                    """
+                    INSERT INTO player_rankings_mm
+                    (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        player_id,
+                        uid,
+                        mode,
+                        rank,
+                        name,
+                        mm_value,
+                        lv,
+                        acc,
+                        combo,
+                        pc,
+                        crawl_time,
+                        source,
+                    ),
+                )
+                # The caller owns the surrounding transaction.
+                return "same_insert"
+            cursor.execute(
+                "UPDATE player_rankings_mm SET crawl_time = ? WHERE id = ?",
+                (crawl_time, last_id),
+            )
+            # The caller owns the surrounding transaction.
+            return "update"
+
+        cursor.execute(
+            """
+            INSERT INTO player_rankings_mm
+            (player_id, uid, mode, rank, name, mm_value, lv, acc, combo, pc, crawl_time, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                player_id,
+                uid,
+                mode,
+                rank,
+                name,
+                mm_value,
+                lv,
+                acc,
+                combo,
+                pc,
+                crawl_time,
+                source,
+            ),
+        )
+        # The caller owns the surrounding transaction.
+        return "diff_insert"
 
 
 def save_player_mmr_sample(
@@ -1369,73 +1342,35 @@ def save_player_mmr_sample(
     crawl_time: datetime,
     source: str,
 ) -> str:
-    db_manager = DatabaseManager()
-    conn = db_manager.get_connection()
-    cursor = conn.cursor()
-    day = crawl_time.date().isoformat()
+    with atomic(DatabaseManager().get_connection()):
+        db_manager = DatabaseManager()
+        conn = db_manager.get_connection()
+        cursor = conn.cursor()
+        day = crawl_time.date().isoformat()
 
-    # Align with ranking dedup model: keep two boundary rows per stable segment.
-    cursor.execute(
-        """
-        SELECT sample_id, mmr, mm_rank, name, source
-        FROM player_mmr_samples
-        WHERE uid = ? AND mode = ?
-        ORDER BY crawl_time DESC
-        LIMIT 2
-        """,
-        (uid, mode),
-    )
-    rows = cursor.fetchall()
-    if not rows:
+        # Align with ranking dedup model: keep two boundary rows per stable segment.
         cursor.execute(
             """
-            INSERT INTO player_mmr_samples
-            (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            SELECT sample_id, mmr, mm_rank, name, source, crawl_time
+            FROM player_mmr_samples
+            WHERE uid = ? AND mode = ?
+            ORDER BY crawl_time DESC
+            LIMIT 2
             """,
-            (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source),
+            (uid, mode),
         )
-        sample_op = "new"
-    else:
-        last_sample_id, last_mmr, last_mm_rank, last_name, last_source = rows[0]
-        has_two_same = False
-        if len(rows) == 2:
-            second = rows[1]
-            has_two_same = (
-                int(second[1] or 0) == int(last_mmr or 0)
-                and (second[2] if second[2] is not None else None) == (last_mm_rank if last_mm_rank is not None else None)
-                and (second[3] or None) == (last_name or None)
-                and (second[4] or "") == (last_source or "")
-            )
-
-        same_as_last = (
-            int(last_mmr or 0) == int(mmr)
-            and (last_mm_rank if last_mm_rank is not None else None) == (mm_rank if mm_rank is not None else None)
-            and (last_name or None) == (name or None)
-            and (last_source or "") == (source or "")
-        )
-        if same_as_last:
-            if not has_two_same:
-                cursor.execute(
-                    """
-                    INSERT INTO player_mmr_samples
-                    (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source),
-                )
-                sample_op = "same_insert"
-            else:
-                cursor.execute(
-                    """
-                    UPDATE player_mmr_samples
-                    SET crawl_time = ?
-                    WHERE sample_id = ?
-                    """,
-                    (crawl_time, last_sample_id),
-                )
-                sample_op = "update"
-        else:
+        rows = cursor.fetchall()
+        if rows:
+            name = name or rows[0][3]
+            if time_text(crawl_time) < time_text(rows[0][5]):
+                return "update"
+            if time_text(crawl_time) == time_text(rows[0][5]) and (
+                mmr,
+                mm_rank,
+                name,
+            ) == (rows[0][1], rows[0][2], rows[0][3]):
+                return "update"
+        if not rows:
             cursor.execute(
                 """
                 INSERT INTO player_mmr_samples
@@ -1444,25 +1379,74 @@ def save_player_mmr_sample(
                 """,
                 (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source),
             )
-            sample_op = "diff_insert"
+            sample_op = "new"
+        else:
+            last_sample_id, last_mmr, last_mm_rank, last_name, last_source, _ = rows[0]
+            has_two_same = False
+            if len(rows) == 2:
+                second = rows[1]
+                has_two_same = (
+                    int(second[1] or 0) == int(last_mmr or 0)
+                    and (second[2] if second[2] is not None else None)
+                    == (last_mm_rank if last_mm_rank is not None else None)
+                    and (second[3] or None) == (last_name or None)
+                )
 
-    cursor.execute(
-        """
-        INSERT INTO player_mmr_daily
-        (uid, mode, day, mmr, mm_rank, name, sample_time, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(uid, mode, day) DO UPDATE SET
-            mmr = excluded.mmr,
-            mm_rank = excluded.mm_rank,
-            name = excluded.name,
-            sample_time = excluded.sample_time,
-            source = excluded.source
-        WHERE excluded.sample_time >= player_mmr_daily.sample_time
-        """,
-        (uid, mode, day, mmr, mm_rank, name, crawl_time, source),
-    )
-    conn.commit()
-    return sample_op
+            same_as_last = (
+                int(last_mmr or 0) == int(mmr)
+                and (last_mm_rank if last_mm_rank is not None else None)
+                == (mm_rank if mm_rank is not None else None)
+                and (last_name or None) == (name or None)
+            )
+            if same_as_last:
+                if not has_two_same:
+                    cursor.execute(
+                        """
+                        INSERT INTO player_mmr_samples
+                        (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source),
+                    )
+                    sample_op = "same_insert"
+                else:
+                    cursor.execute(
+                        """
+                        UPDATE player_mmr_samples
+                        SET crawl_time = ?
+                        WHERE sample_id = ?
+                        """,
+                        (crawl_time, last_sample_id),
+                    )
+                    sample_op = "update"
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO player_mmr_samples
+                    (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (player_id, uid, mode, mmr, mm_rank, name, crawl_time, source),
+                )
+                sample_op = "diff_insert"
+
+        cursor.execute(
+            """
+            INSERT INTO player_mmr_daily
+            (uid, mode, day, mmr, mm_rank, name, sample_time, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(uid, mode, day) DO UPDATE SET
+                mmr = excluded.mmr,
+                mm_rank = excluded.mm_rank,
+                name = excluded.name,
+                sample_time = excluded.sample_time,
+                source = excluded.source
+            WHERE excluded.sample_time >= player_mmr_daily.sample_time
+            """,
+            (uid, mode, day, mmr, mm_rank, name, crawl_time, source),
+        )
+        # The caller owns the surrounding transaction.
+        return sample_op
 
 def update_mm_crawl_status(
     task: str,
@@ -1505,43 +1489,51 @@ def update_mm_crawl_status(
     conn.commit()
 
 
-def fetch_global_mode(
-    session: requests.Session,
-    mode: int,
-    limit: int = DEFAULT_MM_LIMIT,
-    mm: int = 0,
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    from_offset = 0
-    visited_offsets: Set[int] = set()
-    while len(rows) < max(limit, 0):
-        if from_offset in visited_offsets:
+def fetch_global_mode(session, mode, limit=DEFAULT_MM_LIMIT, mm=0):
+    rows = FetchList()
+    offset = 0
+    visited = set()
+    seen = set()
+    while limit is None or len(rows) < max(limit, 0):
+        if offset in visited:
+            rows.error = "repeated_cursor"
             break
-        visited_offsets.add(from_offset)
-
+        visited.add(offset)
         payload = _new_api_get(
             session,
             "/ranking/global",
-            {"mode": mode, "from": from_offset, "mm": 1 if mm else 0},
+            {"mode": mode, "from": offset, "mm": int(bool(mm))},
         )
-        if payload.get("code") != 0:
-            raise RuntimeError(f"ranking/global failed: code={payload.get('code')}")
-        data = payload.get("data") or []
-        if not data:
-            break
+        if (
+            payload.get("code") != 0
+            or not isinstance(payload.get("data"), list)
+            or "hasMore" not in payload
+        ):
+            raise RuntimeError("Invalid ranking/global response")
+        data = payload["data"]
         for item in data:
-            rows.append(item)
-            if len(rows) >= limit:
-                break
-
+            if (
+                not isinstance(item, dict)
+                or _safe_int(item.get("uid")) <= 0
+                or _safe_int(item.get("rank")) <= 0
+                or not item.get("username")
+            ):
+                raise RuntimeError("Invalid ranking row")
+            uid = str(item["uid"])
+            if uid not in seen:
+                seen.add(uid)
+                rows.append(item)
         if not payload.get("hasMore"):
+            rows.complete = True
             break
-        next_offset = payload.get("next")
-        if isinstance(next_offset, int):
-            from_offset = next_offset
-        else:
-            from_offset += len(data)
-
+        next_offset = payload.get("next", offset + len(data))
+        if not data or not isinstance(next_offset, int) or next_offset <= offset:
+            rows.error = "stalled_cursor"
+            break
+        offset = next_offset
+        rows.cursor = offset
+    if limit is not None:
+        del rows[limit:]
     return rows
 
 
@@ -1575,25 +1567,18 @@ def crawl_mode_player_newapi(
                 "rank": _safe_int(item.get("rank"), 0),
                 "name": item.get("username") or f"uid_{uid_int}",
                 "player_id": str(uid_int),
-                "lv": _safe_int(item.get("level"), 0),
-                "exp": _safe_int(item.get("value"), 0),
-                "acc": _safe_float(item.get("acc"), 0.0),
-                "combo": _safe_int(item.get("combo"), 0),
-                "pc": _safe_int(item.get("playcount"), 0),
+                "lv": _safe_int(item.get("level"), None),
+                "exp": _safe_int(item.get("value"), None),
+                "acc": _safe_float(item.get("acc"), None),
+                "combo": _safe_int(item.get("combo"), None),
+                "pc": _safe_int(item.get("playcount"), None),
             }
         )
 
     df = pd.DataFrame(players)
     if not df.empty:
         df = df[df["rank"] > 0]
-        if df["rank"].duplicated().any():
-            dup_count = int(df["rank"].duplicated().sum())
-            logger.warning(
-                "newapi mode %d contains duplicated ranks (%d), keep first row per rank.",
-                mode,
-                dup_count,
-            )
-            df = df.drop_duplicates(subset=["rank"], keep="first")
+        df = df.drop_duplicates(subset=["player_id"], keep="first")
         df = df.sort_values("rank").reset_index(drop=True)
 
     mm_rows: List[Dict[str, Any]] = []
@@ -1603,6 +1588,7 @@ def crawl_mode_player_newapi(
         logger.warning("newapi mm ranking crawl failed for mode %d: %s", mode, e)
         mm_rows = []
 
+    df.attrs["source"] = "newapi_ranking_global"
     return df, mm_rows
 
 
@@ -1623,11 +1609,13 @@ def save_mm_ranking_rows(
     for item in rows:
         uid = str(_safe_int(item.get("uid"), 0))
         rank = _safe_int(item.get("rank"), 0)
-        if uid == "0" or rank <= 0:
+        if (
+            uid == "0"
+            or rank <= 0
+            or not item.get("username")
+            or item.get("value") is None
+        ):
             dropped_invalid += 1
-            continue
-        if rank in seen_ranks:
-            dropped_dup_rank += 1
             continue
         if uid in seen_uids:
             dropped_dup_uid += 1
@@ -1641,7 +1629,7 @@ def save_mm_ranking_rows(
         uid = str(_safe_int(item.get("uid"), 0))
         if uid == "0":
             continue
-        name = item.get("username") or f"uid_{uid}"
+        name = item["username"]
         player_id = resolve_player_identity(name, crawl_time, uid=uid)
         if player_id is None:
             continue
@@ -1652,10 +1640,10 @@ def save_mm_ranking_rows(
             rank=_safe_int(item.get("rank"), 0),
             name=name,
             mm_value=_safe_int(item.get("value"), 0),
-            lv=_safe_int(item.get("level"), 0),
-            acc=_safe_float(item.get("acc"), 0.0),
-            combo=_safe_int(item.get("combo"), 0),
-            pc=_safe_int(item.get("playcount"), 0),
+            lv=_safe_int(item.get("level"), None),
+            acc=_safe_float(item.get("acc"), None),
+            combo=_safe_int(item.get("combo"), None),
+            pc=_safe_int(item.get("playcount"), None),
             crawl_time=crawl_time,
             source=source,
         )
@@ -1672,27 +1660,34 @@ def save_mm_ranking_rows(
     }
 
 
-def fetch_player_mmr_from_api(session: requests.Session, uid: str) -> List[Dict[str, Any]]:
-    payload = _new_api_get(session, "/ranking/player/all", {"touid": _safe_int(uid, -1)})
-    if payload.get("code") != 0:
-        raise RuntimeError(f"ranking/player/all failed: code={payload.get('code')}")
-    data = payload.get("data") or []
-    rows: List[Dict[str, Any]] = []
-    for item in data:
+def fetch_player_mmr_from_api(session, uid):
+    payload = _new_api_get(
+        session, "/ranking/player/all", {"touid": _safe_int(uid, -1)}
+    )
+    if payload.get("code") != 0 or not isinstance(payload.get("data"), list):
+        raise RuntimeError("Invalid ranking/player/all response")
+    rows = FetchList(complete=True)
+    seen = set()
+    for item in payload["data"]:
         mode = _safe_int(item.get("mode"), -1)
-        if mode < 0:
-            continue
+        if mode not in MODES or mode in seen:
+            raise RuntimeError("Invalid/duplicate MMR mode")
+        seen.add(mode)
         mmr = _safe_int(item.get("grade"), -1)
         if mmr < 0:
-            continue
+            raise RuntimeError("Missing MMR value")
         rows.append(
             {
                 "uid": str(uid),
                 "mode": mode,
                 "mmr": mmr,
-                "mm_rank": _safe_int(item.get("gradeRank"), 0) or None,
-                "rank": _safe_int(item.get("rank"), 0) or None,
-                "name": None,
+                "mm_rank": _safe_int(item.get("gradeRank")) or None,
+                "rank": _safe_int(item.get("rank")) or None,
+                "lv": item.get("level"),
+                "acc": item.get("acc"),
+                "combo": item.get("combo"),
+                "pc": item.get("pc"),
+                "name": item.get("username"),
             }
         )
     return rows
@@ -1797,7 +1792,7 @@ def run_mm_sync_cycle(
         logger.warning("MM sync is already running, skip this cycle.")
         return {"skipped": True, "reason": "locked"}
 
-    session = requests.Session()
+    session = limit_session(requests.Session(), 15)
     session.cookies.update(COOKIES)
     session.headers.update(HEADERS)
     session.mount("https://", requests.adapters.HTTPAdapter(max_retries=3))
@@ -1882,12 +1877,16 @@ def run_mm_sync_cycle(
                         )
                     time.sleep(0.2)
                 except SkipCurrentTask as e:
-                    update_mm_crawl_status(task, False, error="skipped_by_user", state={"mode": mode})
+                    update_mm_crawl_status(
+                        task, False, error="skipped_by_user", state={"mode": mode}
+                    )
                     logger.warning("Skip requested, %s skipped.", e)
                     continue
                 except Exception as e:
                     stats["mm_modes_fail"] += 1
-                    update_mm_crawl_status(task, False, error=str(e), state={"mode": mode})
+                    update_mm_crawl_status(
+                        task, False, error=str(e), state={"mode": mode}
+                    )
                     logger.warning("MM global crawl failed for mode %d: %s", mode, e)
                     if HAS_TQDM:
                         mode_iter.set_postfix_str(
@@ -1905,7 +1904,9 @@ def run_mm_sync_cycle(
             stats["mmr_uid_from_mm_top"] = len(mm_uids)
 
         if include_exp_ranking_uids:
-            exp_top_uids = get_recent_exp_tracked_uids(limit_per_mode=max(1, int(exp_limit or mm_limit)))
+            exp_top_uids = get_recent_exp_tracked_uids(
+                limit_per_mode=max(1, int(exp_limit or mm_limit))
+            )
             before = len(mm_uids)
             mm_uids.update(exp_top_uids)
             stats["mmr_uid_from_exp_top"] = len(exp_top_uids)
@@ -1917,7 +1918,9 @@ def run_mm_sync_cycle(
             )
 
         config_players = load_player_config()
-        manual_uids = {str(uid).strip() for uid in config_players if str(uid).strip().isdigit()}
+        manual_uids = {
+            str(uid).strip() for uid in config_players if str(uid).strip().isdigit()
+        }
         before_manual = len(mm_uids)
         mm_uids.update(manual_uids)
         stats["mmr_uid_from_manual"] = len(manual_uids)
@@ -1929,7 +1932,9 @@ def run_mm_sync_cycle(
         )
 
         if seed_uids:
-            valid_seed = {str(uid).strip() for uid in seed_uids if str(uid).strip().isdigit()}
+            valid_seed = {
+                str(uid).strip() for uid in seed_uids if str(uid).strip().isdigit()
+            }
             before_seed = len(mm_uids)
             mm_uids.update(valid_seed)
             stats["mmr_uid_from_seed"] = len(valid_seed)
@@ -1955,7 +1960,9 @@ def run_mm_sync_cycle(
             if mmr_min_interval_minutes and mmr_min_interval_minutes > 0 and uid_list:
                 db_manager = DatabaseManager()
                 cursor = db_manager.get_connection().cursor()
-                cutoff = datetime.now() - timedelta(minutes=int(mmr_min_interval_minutes))
+                cutoff = datetime.now() - timedelta(
+                    minutes=int(mmr_min_interval_minutes)
+                )
                 cursor.execute(
                     """
                     SELECT DISTINCT uid
@@ -1966,7 +1973,9 @@ def run_mm_sync_cycle(
                     """,
                     (cutoff,),
                 )
-                recent_uids = {str(row[0]) for row in cursor.fetchall() if row and row[0]}
+                recent_uids = {
+                    str(row[0]) for row in cursor.fetchall() if row and row[0]
+                }
                 filtered = [uid for uid in uid_list if uid not in recent_uids]
                 stats["mmr_users_skipped_recent"] = len(uid_list) - len(filtered)
                 if stats["mmr_users_skipped_recent"] > 0:
@@ -1978,7 +1987,9 @@ def run_mm_sync_cycle(
                 uid_list = filtered
             total_users = len(uid_list)
             logger.info("MMR sync start: users=%d", total_users)
-            mmr_iter = tqdm(uid_list, desc="MMR抓取", unit="玩家") if HAS_TQDM else uid_list
+            mmr_iter = (
+                tqdm(uid_list, desc="MMR抓取", unit="玩家") if HAS_TQDM else uid_list
+            )
             for idx, uid in enumerate(mmr_iter, start=1):
                 if is_stop_requested():
                     logger.info("Stop requested, interrupt MMR crawl.")
@@ -1989,10 +2000,10 @@ def run_mm_sync_cycle(
                 try:
                     player_rows = fetch_player_mmr_from_api(session, uid)
                     source = "ranking_player_all"
-                    if not player_rows:
+                    if not player_rows and not getattr(player_rows, "complete", False):
                         player_rows = fetch_player_mmr_from_page(session, uid)
                         source = "page_profile"
-                    if not player_rows:
+                    if not player_rows and not getattr(player_rows, "complete", False):
                         stats["mmr_users_fail"] += 1
                         continue
                     for item in player_rows:
@@ -2006,7 +2017,9 @@ def run_mm_sync_cycle(
                             continue
                         name = item.get("name")
                         if name:
-                            player_id = resolve_player_identity(name, crawl_time, uid=uid)
+                            player_id = resolve_player_identity(
+                                name, crawl_time, uid=uid
+                            )
                         else:
                             player_id = get_player_id_by_uid(uid)
                         sample_op = save_player_mmr_sample(
@@ -2038,9 +2051,19 @@ def run_mm_sync_cycle(
                     stats["mmr_users_fail"] += 1
                     logger.warning("MMR crawl failed for uid=%s: %s", uid, e)
                     if HAS_TQDM:
-                        tqdm.write(colorize(f"[MMR][{idx}/{total_users}] uid={uid} failed: {e}", "91"))
+                        tqdm.write(
+                            colorize(
+                                f"[MMR][{idx}/{total_users}] uid={uid} failed: {e}",
+                                "91",
+                            )
+                        )
                     else:
-                        print(colorize(f"[MMR][{idx}/{total_users}] uid={uid} failed: {e}", "91"))
+                        print(
+                            colorize(
+                                f"[MMR][{idx}/{total_users}] uid={uid} failed: {e}",
+                                "91",
+                            )
+                        )
                 if HAS_TQDM:
                     mmr_iter.set_postfix_str(
                         f"ok={stats['mmr_users_ok']} fail={stats['mmr_users_fail']} samples={stats['mmr_samples']}"
@@ -2066,13 +2089,25 @@ def run_mm_sync_cycle(
             update_mm_crawl_status(
                 "mmr_batch",
                 success=(stats["mmr_users_fail"] == 0),
-                error=None if stats["mmr_users_fail"] == 0 else f"failed={stats['mmr_users_fail']}",
+                error=(
+                    None
+                    if stats["mmr_users_fail"] == 0
+                    else f"failed={stats['mmr_users_fail']}"
+                ),
                 state=stats,
             )
 
         # Notify if all MM modes failed
-        if include_mm_ranking and stats.get("mm_modes_fail", 0) > 0 and stats.get("mm_modes_ok", 0) == 0:
-            notify_user("MM排行爬取失败", "所有模式的MM排行均爬取失败，可能需要更新Cookie/Token", "error")
+        if (
+            include_mm_ranking
+            and stats.get("mm_modes_fail", 0) > 0
+            and stats.get("mm_modes_ok", 0) == 0
+        ):
+            notify_user(
+                "MM排行爬取失败",
+                "所有模式的MM排行均爬取失败，可能需要更新Cookie/Token",
+                "error",
+            )
 
         logger.info("MM sync done: %s", stats)
         return stats
@@ -2085,106 +2120,108 @@ def save_to_database(mode, df, crawl_time):
     if df.empty:
         return
 
-    stats = {'new': 0, 'diff_insert': 0, 'same_insert': 0, 'update': 0, 'update_fill': 0}
+    stats = {
+        "new": 0,
+        "diff_insert": 0,
+        "same_insert": 0,
+        "update": 0,
+        "update_fill": 0,
+    }
 
     for _, row in df.iterrows():
-        player_id = resolve_player_identity(row['name'], crawl_time, row.get('player_id'))
+        player_id = resolve_player_identity(
+            row["name"], crawl_time, row.get("player_id")
+        )
         if player_id is not None:
             op = save_player_ranking_record(
                 player_id=player_id,
-                uid=row.get('player_id'),
+                uid=row.get("player_id"),
                 mode=mode,
-                rank=row['rank'],
-                name=row['name'],
-                lv=row['lv'],
-                exp=row['exp'],
-                acc=row['acc'],
-                combo=row['combo'],
-                pc=row['pc'],
+                rank=row["rank"],
+                name=row["name"],
+                lv=row["lv"],
+                exp=row["exp"],
+                acc=row["acc"],
+                combo=row["combo"],
+                pc=row["pc"],
                 crawl_time=crawl_time,
-                source='leaderboard'  # 排行榜数据
+                source=row.get("source", df.attrs.get("source", "leaderboard")),
             )
             stats[op] += 1
 
     total = sum(stats.values())
-    msg = (f"模式 {mode} 数据处理完成: 总计 {total} 条 | "
-           f"{colorize('首次', '92')}: {stats['new']} | "
-           f"{colorize('变化插入', '93')}: {stats['diff_insert']} | "
-           f"{colorize('相同插入', '94')}: {stats['same_insert']} | "
-           f"{colorize('时间更新', '95')}: {stats['update']} | "
-           f"{colorize('LV填充', '96')}: {stats['update_fill']}")
+    msg = (
+        f"模式 {mode} 数据处理完成: 总计 {total} 条 | "
+        f"{colorize('首次', '92')}: {stats['new']} | "
+        f"{colorize('变化插入', '93')}: {stats['diff_insert']} | "
+        f"{colorize('相同插入', '94')}: {stats['same_insert']} | "
+        f"{colorize('时间更新', '95')}: {stats['update']} | "
+        f"{colorize('LV填充', '96')}: {stats['update_fill']}"
+    )
     print(msg)
-    logger.info("模式 %d 数据统计: new=%d, diff=%d, same=%d, update=%d, fill=%d",
-                mode, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'], stats['update_fill'])
+    logger.info(
+        "模式 %d 数据统计: new=%d, diff=%d, same=%d, update=%d, fill=%d",
+        mode,
+        stats["new"],
+        stats["diff_insert"],
+        stats["same_insert"],
+        stats["update"],
+        stats["update_fill"],
+    )
 
 
 def save_player_profile_to_database(player_data, crawl_time, player_identifier):
-    """Smart-save player profile ranking rows and update crawl status."""
-    if not player_data:
-        return False
+    from crawlers.ingestion import observe
 
-    db_manager = DatabaseManager()
-    conn = db_manager.get_connection()
-    cursor = conn.cursor()
-    success = False
-    stats = {'new': 0, 'diff_insert': 0, 'same_insert': 0, 'update': 0, 'update_fill': 0}
-
+    conn = DatabaseManager().get_connection()
     try:
-        for data in player_data:
-            player_id = resolve_player_identity(data['name'], crawl_time, player_identifier)
-            if player_id is not None:
-                op = save_player_ranking_record(
-                    player_id=player_id,
-                    uid=player_identifier,
-                    mode=data['mode'],
-                    rank=data['rank'],
-                    name=data['name'],
-                    lv=data['lv'],
-                    exp=data['exp'],
-                    acc=data['acc'],
-                    combo=data['combo'],
-                    pc=data['pc'],
-                    crawl_time=crawl_time,
-                    source='profile'  # 个人页数据
+        with atomic(conn):
+            for row in player_data:
+                pid = resolve_player_identity(
+                    row["name"], crawl_time, player_identifier
                 )
-                stats[op] += 1
-                success = True
-
-        # Update crawl status after processing this player.
-        cursor.execute('''
-            INSERT OR REPLACE INTO player_crawl_status
-            (player_identifier, last_crawled, crawl_count, success_count, last_error)
-            VALUES (?, ?,
-                COALESCE((SELECT crawl_count FROM player_crawl_status WHERE player_identifier = ?), 0) + 1,
-                COALESCE((SELECT success_count FROM player_crawl_status WHERE player_identifier = ?), 0) + ?,
-                NULL)
-        ''', (player_identifier, crawl_time, player_identifier, player_identifier, 1 if success else 0))
-        conn.commit()
-
-        total = sum(stats.values())
-        msg = (f"玩家 {player_identifier} 数据处理完成: 总计 {total} 条 | "
-               f"{colorize('首次', '92')}: {stats['new']} | "
-               f"{colorize('变化插入', '93')}: {stats['diff_insert']} | "
-               f"{colorize('相同插入', '94')}: {stats['same_insert']} | "
-               f"{colorize('时间更新', '95')}: {stats['update']} | "
-               f"{colorize('LV填充', '96')}: {stats['update_fill']}")
-        print(msg)
-        logger.info("玩家 %s 数据统计: new=%d, diff=%d, same=%d, update=%d, fill=%d",
-                    player_identifier, stats['new'], stats['diff_insert'], stats['same_insert'], stats['update'], stats['update_fill'])
-        return success
-
-    except Exception as e:
-        logger.error("保存玩家 %s 数据到数据库失败: %s", player_identifier, e)
-        # Persist failed crawl status for this player.
-        cursor.execute('''
-            INSERT OR REPLACE INTO player_crawl_status
-            (player_identifier, last_crawled, crawl_count, success_count, last_error)
-            VALUES (?, ?,
-                COALESCE((SELECT crawl_count FROM player_crawl_status WHERE player_identifier = ?), 0) + 1,
-                COALESCE((SELECT success_count FROM player_crawl_status WHERE player_identifier = ?), 0),
-                ?)
-        ''', (player_identifier, crawl_time, player_identifier, player_identifier, str(e)))
-        conn.commit()
+                if pid is None:
+                    raise ValueError("Identity conflict")
+                save_player_ranking_record(
+                    pid,
+                    player_identifier,
+                    row["mode"],
+                    row["rank"],
+                    row["name"],
+                    row.get("lv"),
+                    row.get("exp"),
+                    row.get("acc"),
+                    row.get("combo"),
+                    row.get("pc"),
+                    crawl_time,
+                    "page_profile",
+                )
+            complete = bool(getattr(player_data, "complete", True))
+            if not complete:
+                raise ValueError("Incomplete profile rankings")
+            conn.execute(
+                """INSERT INTO player_crawl_status(player_identifier,last_crawled,crawl_count,success_count,last_error)
+                VALUES(?,?,1,1,NULL) ON CONFLICT(player_identifier) DO UPDATE SET last_crawled=excluded.last_crawled,
+                crawl_count=crawl_count+1,success_count=success_count+1,last_error=NULL""",
+                (player_identifier, crawl_time),
+            )
+            observe(
+                conn,
+                "player_profiles",
+                player_identifier,
+                "ranks",
+                "page_profile",
+                True,
+            )
+        return True
+    except Exception as exc:
+        with atomic(conn):
+            conn.execute(
+                """INSERT INTO player_crawl_status(player_identifier,last_crawled,crawl_count,success_count,last_error)
+                VALUES(?,?,1,0,?) ON CONFLICT(player_identifier) DO UPDATE SET last_crawled=excluded.last_crawled,
+                crawl_count=crawl_count+1,last_error=excluded.last_error""",
+                (player_identifier, crawl_time, str(exc)),
+            )
         return False
 
 
@@ -2483,10 +2520,10 @@ def run_player_crawler():
         logger.info("开始玩家个人主页爬取周期")
         last_player_crawl_time = datetime.now()
 
-        session = requests.Session()
+        session = limit_session(requests.Session(), 15)
         session.cookies.update(COOKIES)
         session.headers.update(HEADERS)
-        session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+        session.mount("https://", requests.adapters.HTTPAdapter(max_retries=3))
 
         with _player_set_lock:
             total_players = len(_player_set)
@@ -2526,21 +2563,29 @@ def run_player_crawler():
                     logger.warning("Skip requested, skip player %s.", player_identifier)
                     continue
 
-                if player_data and save_player_profile_to_database(player_data, crawl_time, player_identifier):
+                if player_data is not None and save_player_profile_to_database(
+                    player_data, crawl_time, player_identifier
+                ):
                     successful_crawls += 1
                 else:
                     failed_crawls += 1
 
                 if HAS_TQDM:
-                    pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
+                    pbar.set_postfix_str(
+                        f"成功: {successful_crawls}, 失败: {failed_crawls}"
+                    )
 
                 time.sleep(3)
 
             except Exception as e:
-                logger.error("Error while processing player %s: %s", player_identifier, e)
+                logger.error(
+                    "Error while processing player %s: %s", player_identifier, e
+                )
                 failed_crawls += 1
                 if HAS_TQDM:
-                    pbar.set_postfix_str(f"成功: {successful_crawls}, 失败: {failed_crawls}")
+                    pbar.set_postfix_str(
+                        f"成功: {successful_crawls}, 失败: {failed_crawls}"
+                    )
             finally:
                 if HAS_TQDM:
                     _ = pbar.update(1)
@@ -2549,7 +2594,9 @@ def run_player_crawler():
         if HAS_TQDM:
             pbar.close()
 
-        logger.info("玩家个人主页爬取完成: 成功 %d, 失败 %d", successful_crawls, failed_crawls)
+        logger.info(
+            "玩家个人主页爬取完成: 成功 %d, 失败 %d", successful_crawls, failed_crawls
+        )
 
     except Exception as e:
         logger.error("玩家爬取周期发生错误: %s", e)
@@ -2811,7 +2858,9 @@ def run_crawler_cycle(
         config_players = load_player_config()
         if config_players:
             add_players_to_queue(config_players)
-            logger.info("周期开始：已重新加载 %d 个配置文件玩家到队列", len(config_players))
+            logger.info(
+                "周期开始：已重新加载 %d 个配置文件玩家到队列", len(config_players)
+            )
 
     try:
         if push_to_git and git_check_updates():
@@ -2827,10 +2876,10 @@ def run_crawler_cycle(
     except Exception as e:
         logger.warning("Git更新检查失败，继续使用本地数据: %s", e)
 
-    session = requests.Session()
+    session = limit_session(requests.Session(), 15)
     session.cookies.update(COOKIES)
     session.headers.update(HEADERS)
-    session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
+    session.mount("https://", requests.adapters.HTTPAdapter(max_retries=3))
 
     start_time = datetime.now()
     logger.info("=" * 50)
@@ -2853,7 +2902,7 @@ def run_crawler_cycle(
             if ranking_source == "newapi":
                 df, mm_rows = crawl_mode_player_newapi(session, mode, ranking_limit)
             else:
-                df = crawl_mode_player(session, mode)
+                df = crawl_mode_player(session, mode, limit=ranking_limit)
             all_dfs.append(df)
 
             if consume_skip_request():
@@ -2861,7 +2910,11 @@ def run_crawler_cycle(
 
             if df.empty:
                 logger.warning("Mode %d returned empty ranking data, skip.", mode)
-                notify_user("排行榜数据为空", f"模式 {mode} 返回空排行榜数据，可能需要更新Cookie/Token", "warning")
+                notify_user(
+                    "排行榜数据为空",
+                    f"模式 {mode} 返回空排行榜数据，可能需要更新Cookie/Token",
+                    "warning",
+                )
                 continue
 
             if save_excel and not check_data_changed(mode, df):
@@ -2898,7 +2951,9 @@ def run_crawler_cycle(
             logger.exception("Unexpected error while processing mode %d", mode)
 
     # Seed MM/MMR sync with players seen in this cycle's leaderboard snapshots.
-    mm_seed_uids: Set[str] = set(get_players_from_leaderboard(all_dfs)) if all_dfs else set()
+    mm_seed_uids: Set[str] = (
+        set(get_players_from_leaderboard(all_dfs)) if all_dfs else set()
+    )
 
     if mm_sync and not is_stop_requested():
         logger.info("Start MM/MMR sync...")
@@ -2909,7 +2964,9 @@ def run_crawler_cycle(
                 include_mm_ranking = not skip_mm_ranking
                 if ranking_source == "newapi" and include_mm_ranking:
                     # newapi ranking already includes MM rows; skip duplicate fetch in mm_sync.
-                    logger.info("Ranking source is newapi, skip duplicate MM ranking fetch in mm_sync.")
+                    logger.info(
+                        "Ranking source is newapi, skip duplicate MM ranking fetch in mm_sync."
+                    )
                     include_mm_ranking = False
                 run_mm_sync_cycle(
                     mm_limit=mm_limit,
@@ -2953,13 +3010,13 @@ def run_crawler_cycle(
             notify_user(
                 "排行榜爬取失败",
                 f"所有 {total_modes} 个模式均返回空数据，可能需要更新Cookie/Token",
-                "error"
+                "error",
             )
         else:
             notify_user(
                 "排行榜爬取部分失败",
                 f"{empty_modes}/{total_modes} 个模式返回空数据",
-                "warning"
+                "warning",
             )
     else:
         notify_user("排行榜爬取完成", f"成功爬取 {total_modes} 个模式的数据", "info")

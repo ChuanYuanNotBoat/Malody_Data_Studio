@@ -161,7 +161,9 @@ class ChartService:
             conn.close()
 
     @db_safe_operation
-    def get_stable_creators(self, selector: MCSelector, limit: int = 20) -> List[CreatorStats]:
+    def get_stable_creators(
+        self, selector: MCSelector, limit: int = 20
+    ) -> List[CreatorStats]:
         """获取Stable谱面创作者排行榜"""
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -170,11 +172,11 @@ class ChartService:
             temp_selector = MCSelector()
             temp_selector.current_mode = selector.current_mode
             temp_selector.set_filters(
-                players=selector.filters['players'],
-                difficulties=selector.filters['difficulties'],
-                time_range=selector.filters['time_range'],
-                modes=selector.filters['modes'],
-                statuses=[2]
+                players=selector.filters["players"],
+                difficulties=selector.filters["difficulties"],
+                time_range=selector.filters["time_range"],
+                modes=selector.filters["modes"],
+                statuses=[2],
             )
 
             where_clause, params = temp_selector.build_chart_sql_where("c")
@@ -192,7 +194,7 @@ class ChartService:
             FROM charts c
             WHERE {where_clause}
             GROUP BY c.creator_name
-            ORDER BY stable_count DESC, avg_heat DESC
+            ORDER BY stable_count DESC, avg_heat DESC, c.stabled_by_name ASC
             LIMIT ?
             """
             params.append(limit)
@@ -206,8 +208,9 @@ class ChartService:
                     stable_count=row[1],
                     avg_level=float(row[2]) if row[2] else None,
                     avg_heat=float(row[3]) if row[3] else None,
-                    max_heat=row[4]
-                ) for row in results
+                    max_heat=row[4],
+                )
+                for row in results
             ]
 
         finally:
@@ -556,12 +559,24 @@ class ChartService:
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        comment_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(chart_comments)")
+        }
+        negative_field = (
+            "is_not_recommend"
+            if "is_not_recommend" in comment_columns
+            else "0 AS is_not_recommend"
+        )
+        negative_filter = (
+            " AND is_not_recommend = 0" if "is_not_recommend" in comment_columns else ""
+        )
+        current_filter = " AND is_current = 1" if "is_current" in comment_columns else ""
         if include_recommend:
             cursor.execute(
-                """
-                SELECT tid, cid, uid, name, content, talk_type, is_recommend, talk_time, crawl_time
+                f"""
+                SELECT tid, cid, uid, name, content, talk_type, is_recommend, {negative_field}, talk_time, crawl_time
                 FROM chart_comments
-                WHERE cid = ?
+                WHERE cid = ?{current_filter}
                 ORDER BY talk_time DESC
                 LIMIT ? OFFSET ?
                 """,
@@ -569,10 +584,11 @@ class ChartService:
             )
         else:
             cursor.execute(
-                """
-                SELECT tid, cid, uid, name, content, talk_type, is_recommend, talk_time, crawl_time
+                f"""
+                SELECT tid, cid, uid, name, content, talk_type, is_recommend, {negative_field}, talk_time, crawl_time
                 FROM chart_comments
-                WHERE cid = ? AND is_recommend = 0
+                WHERE cid = ? AND is_recommend = 0{negative_filter}{current_filter}
+                  AND (talk_type IS NULL OR talk_type != 1)
                 ORDER BY talk_time DESC
                 LIMIT ? OFFSET ?
                 """,
@@ -595,8 +611,10 @@ class ChartService:
         """Get recommender uid bindings for a chart from talk stream."""
         conn = get_db_connection()
         cursor = conn.cursor()
+        columns = {row[1] for row in cursor.execute("PRAGMA table_info(chart_comments)")}
+        current_filter = " AND is_current = 1" if "is_current" in columns else ""
         cursor.execute(
-            """
+            f"""
             SELECT
                 uid,
                 MAX(name) AS name,
@@ -604,7 +622,7 @@ class ChartService:
                 MIN(talk_time) AS first_recommend_time,
                 MAX(talk_time) AS last_recommend_time
             FROM chart_comments
-            WHERE cid = ? AND is_recommend = 1 AND uid IS NOT NULL
+            WHERE cid = ? AND is_recommend = 1 AND uid IS NOT NULL{current_filter}
             GROUP BY uid
             ORDER BY last_recommend_time DESC
             LIMIT ? OFFSET ?

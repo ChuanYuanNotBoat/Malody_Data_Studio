@@ -50,6 +50,19 @@ class TestChartService(TestCase):
         self.service = ChartService()
         self.selector = MCSelector()
 
+    def test_hot_charts_accepts_unknown_donation(self):
+        def connection_with_unknown_donation():
+            conn = _seed_conn()
+            conn.execute("ALTER TABLE charts ADD COLUMN version TEXT DEFAULT 'Hard'")
+            conn.execute("UPDATE charts SET donate_count = NULL")
+            conn.commit()
+            return conn
+
+        with patch("malody_api.core.services.chart_service.get_db_connection", side_effect=connection_with_unknown_donation):
+            charts = self.service.get_hot_charts(self.selector)
+        self.assertEqual(len(charts), 1)
+        self.assertIsNone(charts[0].donate_count)
+
     def test_summary(self):
         with patch("malody_api.core.services.chart_service.get_db_connection", side_effect=_seed_conn):
             data = self.service.get_chart_summary(self.selector, detail_level="detailed")
