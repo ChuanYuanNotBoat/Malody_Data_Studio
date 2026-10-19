@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import sys
 import threading
 import time
@@ -140,6 +141,7 @@ NEW_API_BASE_URL = "https://api.mugzone.net/api"
 TALK_LIST_URL = BASE_URL + "/plugin/talk/list"
 TALK_FETCH_MAX_PAGES = 20
 TALK_FETCH_MAX_ITEMS = 500
+REQUEST_PROGRESS_INTERVAL_SECONDS = 30
 
 # 谱面状态映射
 STATUS_MAP = {
@@ -236,6 +238,54 @@ class STBCrawler:
     def setup_crawler_logging(self):
         """为爬虫设置专门的日志记录器"""
         self.logger = logging.getLogger('STBCrawler')
+
+    def _get_with_progress(self, label, url, **kwargs):
+        """Keep rate-limit waits and slow/retried requests visible without logging tokens."""
+        started = time.monotonic()
+        self.logger.info("开始请求：%s（包含限速等待）", label)
+        finished = threading.Event()
+
+        def report_wait():
+            while not finished.wait(REQUEST_PROGRESS_INTERVAL_SECONDS):
+                self.logger.info(
+                    "仍在等待：%s，已用时 %.0f 秒（限速等待、服务器响应或网络重试中）",
+                    label,
+                    time.monotonic() - started,
+                )
+
+        reporter = threading.Thread(
+            target=report_wait, name="stb-request-progress", daemon=True
+        )
+        reporter.start()
+        try:
+            response = self.session.get(url, **kwargs)
+        except requests.RequestException as exc:
+            self.logger.warning(
+                "请求失败：%s，用时 %.1f 秒，原因：%s",
+                label,
+                time.monotonic() - started,
+                self._request_error_text(exc),
+            )
+            raise
+        finally:
+            finished.set()
+            reporter.join()
+        self.logger.info(
+            "收到响应：%s，HTTP %s，用时 %.1f 秒",
+            label,
+            response.status_code,
+            time.monotonic() - started,
+        )
+        return response
+
+    @staticmethod
+    def _request_error_text(exc):
+        # requests exceptions may contain a complete API URL, including its key.
+        if isinstance(exc, requests.RequestException):
+            response = getattr(exc, "response", None)
+            status = f" (HTTP {response.status_code})" if response is not None else ""
+            return type(exc).__name__ + status
+        return str(exc)
 
     def _start_summary_hotkey_listener(self):
         """Listen for Ctrl+O in an interactive Windows console."""
@@ -478,7 +528,7 @@ class STBCrawler:
             # 测试访问排行榜页面（与主爬虫相同）
             test_url = BASE_URL + "/page/all/player?from=0&mode=0"
             self.logger.debug("测试连接: %s", test_url)
-            response = self.session.get(test_url, timeout=30)
+            response = self._get_with_progress("连接测试：排行榜", test_url, timeout=30)
             response.raise_for_status()
 
             self.log_request_details(test_url, response)
@@ -490,7 +540,9 @@ class STBCrawler:
 
             # 测试访问主页
             self.logger.debug("测试主页: %s", HOMEPAGE_URL)
-            response = self.session.get(HOMEPAGE_URL, timeout=30)
+            response = self._get_with_progress(
+                "连接测试：主页", HOMEPAGE_URL, timeout=30
+            )
             response.raise_for_status()
 
             self.log_request_details(HOMEPAGE_URL, response)
@@ -509,7 +561,9 @@ class STBCrawler:
 
             # 探测需要登录态的页面，便于给出明确提示
             latest_probe_url = BASE_URL + "/page/latest"
-            latest_probe_resp = self.session.get(latest_probe_url, timeout=30)
+            latest_probe_resp = self._get_with_progress(
+                "连接测试：最近变动和登录状态", latest_probe_url, timeout=30
+            )
             if latest_probe_resp.status_code == 403:
                 self.auth_required_detected = True
                 self.logger.warning(
@@ -544,7 +598,7 @@ class STBCrawler:
         """备用连接测试方法"""
         try:
             # 只测试基础连接
-            response = self.session.get(BASE_URL, timeout=30)
+            response = self._get_with_progress("备用连接测试", BASE_URL, timeout=30)
             response.raise_for_status()
             self.logger.info("备用连接测试成功")
             return True
@@ -570,7 +624,8 @@ class STBCrawler:
         if mode is not None:
             params["mode"] = mode
         try:
-            response = self.session.get(
+            response = self._get_with_progress(
+                f"谱面搜索 mode={mode} status={status} page={page}",
                 SEARCH_API_URL,
                 params=params,
                 headers={
@@ -658,18 +713,18 @@ class STBCrawler:
         """在发起 API 请求前应用速率限制"""
         if not self._rate_limit_enabled:
             return
-        
+
         current_time = time.time()
         time_since_last_request = current_time - self._last_api_request_time
-        
+
         if time_since_last_request < self._api_request_interval:
             wait_time = self._api_request_interval - time_since_last_request
             # 加入 5-15% 的随机抖动，防止规律性
             jitter = wait_time * (0.05 + 0.1 * random.random())
             total_wait = wait_time + jitter
-            self.logger.debug("API 速率限制：等待 %.2f 秒", total_wait)
+            self.logger.info("API 速率限制：等待 %.1f 秒后继续请求", total_wait)
             time.sleep(total_wait)
-        
+
         self._last_api_request_time = time.time()
 
     def _new_api_ensure_guest_auth(self, force_refresh=False):
@@ -678,7 +733,9 @@ class STBCrawler:
 
         url = NEW_API_BASE_URL + "/web/auth/guest/wt"
         for attempt in range(3):
-            resp = self.session.get(url, headers=self._new_api_headers(), timeout=30)
+            resp = self._get_with_progress(
+                "新官网API：访客鉴权", url, headers=self._new_api_headers(), timeout=30
+            )
             resp.raise_for_status()
             try:
                 data = self._parse_new_api_json(resp, "/web/auth/guest/wt")
@@ -710,14 +767,25 @@ class STBCrawler:
     def _new_api_get(self, path, params=None, use_store_key=False, retry_on_auth=True):
         # 应用速率限制
         self._apply_api_rate_limit()
-        
+
         auth = self._new_api_ensure_guest_auth()
         request_params = dict(params or {})
         request_params.setdefault("uid", auth["uid"])
         request_params.setdefault("key", auth["store_key"] if use_store_key else auth["key"])
 
         url = NEW_API_BASE_URL + (path if path.startswith("/") else f"/{path}")
-        resp = self.session.get(url, params=request_params, headers=self._new_api_headers(), timeout=30)
+        identifiers = " ".join(
+            f"{name}={request_params[name]}"
+            for name in ("cid", "sid", "from")
+            if name in request_params
+        )
+        resp = self._get_with_progress(
+            f"新官网API：{path} {identifiers}".rstrip(),
+            url,
+            params=request_params,
+            headers=self._new_api_headers(),
+            timeout=30,
+        )
         resp.raise_for_status()
         data = self._parse_new_api_json(resp, path)
 
@@ -768,14 +836,15 @@ class STBCrawler:
         result.generation_started_at = generation_started_at
         seen = set()
         previous_cursor = params.get("start")
-        for _ in range(max_pages or 1000000):
+        for page_index in range(max_pages or 1000000):
             if self._should_stop():
                 result.error = "stopped"
                 break
             try:
                 if getattr(self, "_rate_limit_enabled", False):
                     self._apply_api_rate_limit()
-                response = self.session.get(
+                response = self._get_with_progress(
+                    f"评论/推荐 CID={cid} 第 {page_index + 1} 页",
                     TALK_LIST_URL,
                     params=params,
                     headers={
@@ -788,6 +857,16 @@ class STBCrawler:
                 payload = response.json()
                 if not isinstance(payload, dict) or payload.get("code", 0) != 0:
                     raise ValueError("Invalid talk response")
+                # The official talk UI treats {"code": 0} as an empty result.
+                if payload == {"code": 0}:
+                    result.complete = True
+                    result.cursor = None
+                    self.logger.info(
+                        "评论/推荐 CID=%s 第 %d 页：空列表，已到末页",
+                        cid,
+                        page_index + 1,
+                    )
+                    break
                 data = (
                     payload.get("data")
                     if isinstance(payload.get("data"), dict)
@@ -796,8 +875,7 @@ class STBCrawler:
                 items = data.get("list")
                 if not isinstance(items, list):
                     raise ValueError("Missing talk list")
-                if "next" not in data:
-                    raise ValueError("Missing talk pagination state")
+                # The source omits `next` on terminal pages; the UI uses its truthiness.
                 has_more = bool(data.get("next"))
                 for item in items:
                     if (
@@ -809,6 +887,14 @@ class STBCrawler:
                     if item["tid"] not in seen:
                         seen.add(item["tid"])
                         result.append(item)
+                self.logger.info(
+                    "评论/推荐 CID=%s 第 %d 页：%d 条，本次累计 %d 条，%s",
+                    cid,
+                    page_index + 1,
+                    len(items),
+                    len(result),
+                    "还有下一页" if has_more else "已到末页",
+                )
                 if not has_more:
                     result.complete = True
                     result.cursor = None
@@ -829,11 +915,18 @@ class STBCrawler:
                     result.error = "item_limit"
                     break
             except (requests.RequestException, ValueError, TypeError) as exc:
-                result.error = str(exc)
+                result.error = self._request_error_text(exc)
                 result.cursor = params.get("start")
                 break
         if not result.complete and result.error is None:
             result.error = "page_limit"
+        if not result.complete:
+            self.logger.warning(
+                "评论/推荐 CID=%s 尚未抓全：%s；本次获取 %d 条，保留已有数据和分页进度",
+                cid,
+                result.error,
+                len(result),
+            )
         return result
 
     def _build_chart_social_data(self, cid: int):
@@ -1020,7 +1113,11 @@ class STBCrawler:
         try:
             if getattr(self, "_rate_limit_enabled", False):
                 self._apply_api_rate_limit()
-            response = self.session.get(CHART_URL.format(cid=cid), timeout=30)
+            response = self._get_with_progress(
+                f"谱面 CID={cid} 的页面指标和标签",
+                CHART_URL.format(cid=cid),
+                timeout=30,
+            )
             response.raise_for_status()
             extra_chart, extra_song = self.parse_chart_page(response.text, int(cid))
             page_metrics = parse_chart_metrics(response.text)
@@ -1051,6 +1148,10 @@ class STBCrawler:
 
     def crawl_from_new_api(self, max_charts=60, max_songs=600, modes=None, statuses=None):
         self.mode_filter, self.status_filter = modes, statuses
+        self.logger.info(
+            "开始新官网API爬取：本轮最多保存 %d 个谱面；每个谱面需要歌曲、页面和评论等多个请求",
+            max_charts,
+        )
         self._new_api_ensure_guest_auth()
         conn = self.db_manager.get_connection()
         scope = "newapi:" + json.dumps(
@@ -1061,6 +1162,7 @@ class STBCrawler:
             sort_keys=True,
         )
         store = TaskStore(conn, scope)
+        self.logger.info("新官网API持久任务队列：%s", store.counts())
         row = conn.execute(
             "SELECT detail FROM crawl_observations WHERE entity='discovery' AND object_id=? AND section='cursor'",
             (scope,),
@@ -1073,15 +1175,24 @@ class STBCrawler:
                 conn.execute("DELETE FROM crawl_tasks WHERE scope=?", (scope,))
             discovery = {"offset": 0, "complete": False}
         if not discovery.get("complete") and not self._should_stop():
+            self.logger.info(
+                "发现歌曲：读取商店列表，游标=%s", discovery.get("offset", 0)
+            )
             response = self._new_api_get(
                 "/store/list2",
                 {"from": discovery.get("offset", 0), "type": 0},
                 use_store_key=True,
             )
             if response.get("code") != 0 or not isinstance(response.get("data"), list):
-                return -1
+                self.logger.error(
+                    "商店列表无效：code=%s，data 类型=%s；保留原进度",
+                    response.get("code"),
+                    type(response.get("data")).__name__,
+                )
+                return -1 if response.get("code") == -1000 else 0
             if "hasMore" not in response:
-                return -1
+                self.logger.error("商店列表缺少 hasMore 分页字段；保留原进度")
+                return 0
             following = response.get(
                 "next", discovery.get("offset", 0) + len(response["data"])
             )
@@ -1093,7 +1204,7 @@ class STBCrawler:
                 self.logger.error(
                     "Store discovery cursor stalled; preserving previous progress"
                 )
-                return -1
+                return 0
             # Persist every discovered SID before fetching any of its chart lists.
             with atomic(conn):
                 for song in response["data"]:
@@ -1117,6 +1228,12 @@ class STBCrawler:
                     discovery["complete"],
                     detail=discovery,
                 )
+            self.logger.info(
+                "商店列表已记录 %d 条歌曲，下一游标=%s，%s",
+                len(response["data"]),
+                discovery["offset"],
+                "歌曲发现已完成" if discovery["complete"] else "后续列表将在下轮继续",
+            )
         success = 0
         attempts = 0
         while (
@@ -1124,11 +1241,23 @@ class STBCrawler:
             and success < max_charts
             and not self._should_stop()
         ):
+            if self._consume_skip("new API source"):
+                break
             claimed = store.claim(1)
             if not claimed:
+                self.logger.info("新官网API暂无可立即执行的任务：%s", store.counts())
                 break
             kind, object_id, payload = claimed[0]
             attempts += 1
+            started = time.monotonic()
+            self.logger.info(
+                "新官网API任务 %d：%s ID=%s（本轮已保存谱面 %d/%d）",
+                attempts,
+                kind,
+                object_id,
+                success,
+                max_charts,
+            )
             try:
                 if kind == "song":
                     response = self._new_api_get(
@@ -1138,6 +1267,7 @@ class STBCrawler:
                         response.get("data"), list
                     ):
                         raise ValueError("Incomplete song list")
+                    matched = 0
                     with atomic(conn):
                         for hint in response["data"]:
                             if modes is not None and hint.get("mode") not in modes:
@@ -1147,7 +1277,15 @@ class STBCrawler:
                             store.add(
                                 "chart", hint["cid"], {"sid": int(object_id), "hint": hint}
                             )
+                            matched += 1
                     store.finish(kind, object_id)
+                    self.logger.info(
+                        "歌曲 SID=%s：发现 %d 个谱面，%d 个符合筛选条件并已记录任务，用时 %.1f 秒",
+                        object_id,
+                        len(response["data"]),
+                        matched,
+                        time.monotonic() - started,
+                    )
                     continue
                 if kind == "comments":
                     _, _, items = self._build_chart_social_data(int(object_id))
@@ -1170,6 +1308,18 @@ class STBCrawler:
                         state="done" if getattr(items, "complete", False) else "retry",
                         error=getattr(items, "error", None),
                     )
+                    if getattr(items, "complete", False):
+                        self.logger.info(
+                            "评论/推荐 CID=%s 已完整保存，本次 %d 条",
+                            object_id,
+                            len(items),
+                        )
+                    else:
+                        self.logger.warning(
+                            "评论/推荐 CID=%s 待补抓，60 秒后可重试：%s",
+                            object_id,
+                            getattr(items, "error", None),
+                        )
                     continue
                 info = self._new_api_get("/community/chart/info", {"cid": int(object_id)})
                 if info.get("code") != 0:
@@ -1181,6 +1331,9 @@ class STBCrawler:
                 if not self._save_chart_data_from_new_api(info, song, payload.get("hint")):
                     if getattr(self, "last_fetch_state", None) == "filtered":
                         store.finish(kind, object_id)
+                        self.logger.info(
+                            "谱面 CID=%s 不符合筛选条件，已跳过", object_id
+                        )
                         continue
                     raise ValueError("Chart not saved")
                 success += 1
@@ -1188,8 +1341,35 @@ class STBCrawler:
                 if not self.last_social_complete:
                     with atomic(conn):
                         store.add("comments", object_id)
+                self.logger.info(
+                    "已保存谱面 CID=%s（本轮 %d/%d），用时 %.1f 秒；%s",
+                    object_id,
+                    success,
+                    max_charts,
+                    time.monotonic() - started,
+                    (
+                        "评论/推荐完整"
+                        if self.last_social_complete
+                        else "评论/推荐待补抓，已加入持久任务队列"
+                    ),
+                )
             except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
-                store.finish(kind, object_id, state="retry", error=str(exc))
+                error = self._request_error_text(exc)
+                store.finish(kind, object_id, state="retry", error=error)
+                self.logger.warning(
+                    "新官网API任务失败：%s ID=%s，用时 %.1f 秒；已保留任务，60 秒后可重试：%s",
+                    kind,
+                    object_id,
+                    time.monotonic() - started,
+                    error,
+                )
+        self.logger.info(
+            "新官网API本轮结束：保存谱面 %d/%d，处理任务 %d 个，队列状态：%s",
+            success,
+            max_charts,
+            attempts,
+            store.counts(),
+        )
         return success
 
     def parse_chart_page(self, html, cid):
@@ -1320,7 +1500,9 @@ class STBCrawler:
             self.last_fetch_state = "skipped"
             return False
         try:
-            response = self.session.get(CHART_URL.format(cid=cid), timeout=30)
+            response = self._get_with_progress(
+                f"谱面详情 CID={cid}", CHART_URL.format(cid=cid), timeout=30
+            )
             if self._is_confirmed_chart_deleted(response):
                 self.mark_chart_deleted(cid)
                 self.last_fetch_state = "not_found"
@@ -1667,7 +1849,9 @@ class STBCrawler:
 
         try:
             self.logger.debug("访问主页: %s", HOMEPAGE_URL)
-            response = self.session.get(HOMEPAGE_URL, timeout=30)
+            response = self._get_with_progress(
+                "读取主页谱面列表", HOMEPAGE_URL, timeout=30
+            )
             response.raise_for_status()
 
             self.log_request_details(HOMEPAGE_URL, response)
@@ -1823,7 +2007,9 @@ class STBCrawler:
 
     def get_charts_from_song_page(self, sid):
         try:
-            response = self.session.get(SONG_URL.format(sid=sid), timeout=30)
+            response = self._get_with_progress(
+                f"歌曲 SID={sid} 的页面和谱面列表", SONG_URL.format(sid=sid), timeout=30
+            )
             if response.status_code == 404:
                 if self._is_confirmed_chart_deleted(response):
                     return FetchList(complete=True, error="not_found")
@@ -1871,7 +2057,9 @@ class STBCrawler:
         latest_url = BASE_URL + "/page/latest"
         try:
             self.logger.debug("访问最近变动页面: %s", latest_url)
-            response = self.session.get(latest_url, timeout=30)
+            response = self._get_with_progress(
+                "读取最近变动谱面列表", latest_url, timeout=30
+            )
             response.raise_for_status()
 
             self.log_request_details(latest_url, response)
@@ -3164,4 +3352,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

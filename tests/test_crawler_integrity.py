@@ -4,6 +4,7 @@ from collections import deque
 from contextlib import closing
 from datetime import datetime, timedelta
 import json
+import logging
 from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
@@ -14,6 +15,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 
 from bs4 import BeautifulSoup
 import requests
@@ -970,6 +972,99 @@ class IntegrityCase(TestCase):
         rows = self.chart._fetch_chart_talk_items(17302)
         self.assertFalse(rows.complete)
         self.assertEqual(rows.error, "ambiguous_time_cursor")
+
+    def test_live_talk_empty_success_is_complete(self):
+        r = response()
+        r.json.return_value = {"code": 0}  # Live CID 156762; no comments.
+        self.chart.session.get.return_value = r
+        rows = self.chart._fetch_chart_talk_items(156762)
+        self.assertTrue(rows.complete)
+        self.assertEqual(list(rows), [])
+        self.assertIsNone(rows.error)
+        self.assertIsNone(rows.cursor)
+
+    def test_live_talk_terminal_page_can_omit_next(self):
+        first, last = response(), response()
+        first.json.return_value = {
+            "code": 0,
+            "data": {"list": [{"tid": 2, "time": 100}], "next": True},
+        }
+        # Same terminal envelope as live CID 151181, following a nonterminal page.
+        last.json.return_value = {"code": 0, "data": {"list": [{"tid": 1, "time": 99}]}}
+        self.chart.session.get.side_effect = [first, last]
+        rows = self.chart._fetch_chart_talk_items(151181)
+        self.assertTrue(rows.complete)
+        self.assertEqual([item["tid"] for item in rows], [2, 1])
+        self.assertIsNone(rows.cursor)
+
+    def test_unknown_talk_shape_stays_partial_and_reports_failure(self):
+        self.chart.logger = logging.getLogger("STBCrawler")
+        r = response()
+        r.json.return_value = {"code": 0, "data": {"unexpected": True}}
+        self.chart.session.get.return_value = r
+        with self.assertLogs("STBCrawler", level="INFO") as captured:
+            rows = self.chart._fetch_chart_talk_items(17302)
+        self.assertFalse(rows.complete)
+        self.assertEqual(rows.error, "Missing talk list")
+        self.assertIn("尚未抓全", "\n".join(captured.output))
+
+    def test_slow_request_reports_wait_and_completion_without_exposing_keys(self):
+        messages = []
+        heartbeat = threading.Event()
+
+        def log(message, *args):
+            rendered = message % args
+            messages.append(rendered)
+            if "仍在等待" in rendered:
+                heartbeat.set()
+
+        self.chart.logger.info.side_effect = log
+        received = response()
+
+        def fetch(*args, **kwargs):
+            self.assertIn("开始请求", messages[0])
+            self.assertTrue(
+                heartbeat.wait(2), "A slow request must emit progress before returning"
+            )
+            return received
+
+        self.chart.session.get.side_effect = fetch
+        url = "https://api.mugzone.net/api/community/chart/info?key=example-private-key"
+        with patch("crawlers.stb.REQUEST_PROGRESS_INTERVAL_SECONDS", 0.01):
+            self.assertIs(
+                self.chart._get_with_progress("谱面 CID=17302", url, timeout=30),
+                received,
+            )
+        self.assertIn("收到响应", messages[-1])
+        self.assertNotIn("example-private-key", "\n".join(messages))
+        self.assertFalse(
+            any(t.name == "stb-request-progress" for t in threading.enumerate())
+        )
+
+    def test_newapi_failure_is_visible_and_remains_in_retry_queue(self):
+        self.chart.logger = logging.getLogger("STBCrawler")
+        self.chart._new_api_ensure_guest_auth = Mock()
+
+        def api(path, params=None, **kwargs):
+            if path == "/store/list2":
+                return {"code": 0, "data": [{"sid": 4448}], "hasMore": False}
+            if path == "/community/song/charts":
+                return {"code": 0, "data": [{"cid": 17302, "mode": 0, "type": 0}]}
+            raise requests.ReadTimeout("Request failed: ?key=example-private-key")
+
+        self.chart._new_api_get = Mock(side_effect=api)
+        with self.assertLogs("STBCrawler", level="INFO") as captured:
+            self.assertEqual(self.chart.crawl_from_new_api(max_charts=1), 0)
+        output = "\n".join(captured.output)
+        for expected in ("17302", "ReadTimeout", "60 秒后可重试", "本轮结束", "retry"):
+            self.assertIn(expected, output)
+        self.assertNotIn("example-private-key", output)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT state,last_error FROM crawl_tasks WHERE kind='chart'"
+            ).fetchone(),
+            ("retry", "ReadTimeout"),
+        )
 
     def test_newapi_limit_persists_all_children_and_cursor(self):
         self.chart._new_api_ensure_guest_auth = Mock()
