@@ -2,7 +2,7 @@
 
 ## Merge Gates (required)
 1. Unit tests:
-   - `python -m unittest discover -s tests -p "test_*.py" -v`
+   - `python -m unittest discover -s tests -t . -p "test_*.py" -v`
 2. Compile check:
    - `python -m compileall -q .`
 3. Stats/API consistency gate:
