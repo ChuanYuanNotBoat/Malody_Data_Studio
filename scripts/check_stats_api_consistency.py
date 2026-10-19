@@ -85,7 +85,7 @@ def calc_top_stabilizers_baseline(conn: sqlite3.Connection, mode: int, limit: in
     FROM charts
     WHERE {' AND '.join(where)}
     GROUP BY stabled_by_name
-    ORDER BY stable_count DESC
+    ORDER BY stable_count DESC, AVG(heat) DESC, stabled_by_name ASC
     LIMIT ?
     """
     cur.execute(q, params)

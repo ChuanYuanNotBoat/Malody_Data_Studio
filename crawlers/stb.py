@@ -1,13 +1,15 @@
-﻿import argparse
+import argparse
 import hashlib
 import json
 import logging
 import os
 import random
 import re
+import sqlite3
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -31,6 +33,9 @@ from crawlers.rankings import (
   is_stop_requested,
   consume_skip_request,
 )
+from crawlers.chart_metrics import parse_chart_metrics
+from crawlers.chart_votes import classify_chart_vote, nonnegative_count
+from crawlers.ingestion import (atomic, atomic_json, ensure_schema, FetchList, TaskStore, is_login_page, public_record, save_record, observe, now, row_dict, limit_session)
 
 if os.name == "nt":
     try:
@@ -136,6 +141,7 @@ NEW_API_BASE_URL = "https://api.mugzone.net/api"
 TALK_LIST_URL = BASE_URL + "/plugin/talk/list"
 TALK_FETCH_MAX_PAGES = 20
 TALK_FETCH_MAX_ITEMS = 500
+REQUEST_PROGRESS_INTERVAL_SECONDS = 30
 
 # 谱面状态映射
 STATUS_MAP = {
@@ -182,22 +188,24 @@ class STBCrawler:
             }
 
             # 添加CSRF token到headers
-            if 'csrftoken' in COOKIES:
-                headers['X-CSRFToken'] = COOKIES['csrftoken']
-                headers['X-CSRF-Token'] = COOKIES['csrftoken']
-                headers['X-CSRFTOKEN'] = COOKIES['csrftoken']
+            if "csrftoken" in COOKIES:
+                headers["X-CSRFToken"] = COOKIES["csrftoken"]
+                headers["X-CSRF-Token"] = COOKIES["csrftoken"]
+                headers["X-CSRFTOKEN"] = COOKIES["csrftoken"]
 
             self.session.headers.update(headers)
 
             # 使用与主爬虫相同的适配器配置
-            self.session.mount('https://', requests.adapters.HTTPAdapter(
-                max_retries=3,
-                pool_connections=10,
-                pool_maxsize=10
-            ))
+            self.session.mount(
+                "https://",
+                requests.adapters.HTTPAdapter(
+                    max_retries=3, pool_connections=10, pool_maxsize=10
+                ),
+            )
         else:
             self.session = session
 
+        limit_session(self.session, 15)
         self.db_manager = DatabaseManager()
         self.init_database()
 
@@ -221,7 +229,7 @@ class STBCrawler:
             "failed": 0,
         }
         self._start_summary_hotkey_listener()
-        
+
         # 速率限制相关
         self._last_api_request_time = 0  # 最后一次 API 请求的时间
         self._api_request_interval = 1.0  # 默认每次请求间隔 1 秒（可通过方法调整）
@@ -230,6 +238,54 @@ class STBCrawler:
     def setup_crawler_logging(self):
         """为爬虫设置专门的日志记录器"""
         self.logger = logging.getLogger('STBCrawler')
+
+    def _get_with_progress(self, label, url, **kwargs):
+        """Keep rate-limit waits and slow/retried requests visible without logging tokens."""
+        started = time.monotonic()
+        self.logger.info("开始请求：%s（包含限速等待）", label)
+        finished = threading.Event()
+
+        def report_wait():
+            while not finished.wait(REQUEST_PROGRESS_INTERVAL_SECONDS):
+                self.logger.info(
+                    "仍在等待：%s，已用时 %.0f 秒（限速等待、服务器响应或网络重试中）",
+                    label,
+                    time.monotonic() - started,
+                )
+
+        reporter = threading.Thread(
+            target=report_wait, name="stb-request-progress", daemon=True
+        )
+        reporter.start()
+        try:
+            response = self.session.get(url, **kwargs)
+        except requests.RequestException as exc:
+            self.logger.warning(
+                "请求失败：%s，用时 %.1f 秒，原因：%s",
+                label,
+                time.monotonic() - started,
+                self._request_error_text(exc),
+            )
+            raise
+        finally:
+            finished.set()
+            reporter.join()
+        self.logger.info(
+            "收到响应：%s，HTTP %s，用时 %.1f 秒",
+            label,
+            response.status_code,
+            time.monotonic() - started,
+        )
+        return response
+
+    @staticmethod
+    def _request_error_text(exc):
+        # requests exceptions may contain a complete API URL, including its key.
+        if isinstance(exc, requests.RequestException):
+            response = getattr(exc, "response", None)
+            status = f" (HTTP {response.status_code})" if response is not None else ""
+            return type(exc).__name__ + status
+        return str(exc)
 
     def _start_summary_hotkey_listener(self):
         """Listen for Ctrl+O in an interactive Windows console."""
@@ -266,15 +322,7 @@ class STBCrawler:
 
     @staticmethod
     def _is_login_required_page(html):
-        if not html:
-            return False
-        markers = (
-            'id="J_signin"',
-            'id="J_toplogin"',
-            'name="email"',
-            '<div class="g_title">Sign in</div>',
-        )
-        return any(marker in html for marker in markers)
+        return is_login_page(html)
 
     @staticmethod
     def _has_auth_cookies():
@@ -325,7 +373,7 @@ class STBCrawler:
         cursor = self.db_manager.get_connection().cursor()
 
         # 歌曲表
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS songs (
             sid INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
@@ -337,10 +385,10 @@ class STBCrawler:
             crawl_time TIMESTAMP NOT NULL,
             data_hash TEXT
         )
-        ''')
+        """)
 
         # 谱面表
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS charts (
             cid INTEGER PRIMARY KEY,
             sid INTEGER NOT NULL,
@@ -356,9 +404,10 @@ class STBCrawler:
             heat INTEGER DEFAULT 0,
             love_count INTEGER DEFAULT 0,
             recommend_count INTEGER DEFAULT 0,
+            not_recommend_count INTEGER DEFAULT NULL,
             comment_count INTEGER DEFAULT 0,
-            donate_count INTEGER DEFAULT 0,
-            play_count INTEGER DEFAULT 0,
+            donate_count INTEGER DEFAULT NULL,
+            play_count INTEGER DEFAULT NULL,
             last_updated TIMESTAMP,
             crawl_time TIMESTAMP NOT NULL,
             data_hash TEXT,
@@ -366,10 +415,10 @@ class STBCrawler:
             deleted_at TIMESTAMP,
             FOREIGN KEY (sid) REFERENCES songs (sid)
         )
-        ''')
+        """)
 
         # 谱面评论/推荐流水（来源: /plugin/talk/list）
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS chart_comments (
             tid INTEGER PRIMARY KEY,
             cid INTEGER NOT NULL,
@@ -378,31 +427,39 @@ class STBCrawler:
             content TEXT,
             talk_type INTEGER,
             is_recommend INTEGER DEFAULT 0,
+            is_not_recommend INTEGER NOT NULL DEFAULT 0,
             talk_time TIMESTAMP,
             crawl_time TIMESTAMP NOT NULL,
             FOREIGN KEY (cid) REFERENCES charts (cid)
         )
-        ''')
+        """)
 
         # 爬虫状态表
-        cursor.execute('''
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS stb_crawler_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             last_crawl_time TIMESTAMP,
             last_chart_cid INTEGER
         )
-        ''')
+        """)
 
         # 创建索引
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_sid ON charts(sid)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_mode ON charts(mode)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_status ON charts(status)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_charts_last_updated ON charts(last_updated)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_cid ON chart_comments(cid)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_time ON chart_comments(talk_time)')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_charts_sid ON charts(sid)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_charts_mode ON charts(mode)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_charts_status ON charts(status)")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_charts_last_updated ON charts(last_updated)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chart_comments_cid ON chart_comments(cid)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chart_comments_time ON chart_comments(talk_time)"
+        )
 
         # 检查并添加缺失的列
         self._check_and_add_missing_columns()
+        ensure_schema(self.db_manager.get_connection())
 
         self.db_manager.get_connection().commit()
         self.logger.info("STB谱面数据库表初始化完成")
@@ -429,6 +486,9 @@ class STBCrawler:
             if 'comment_count' not in chart_columns:
                 cursor.execute('ALTER TABLE charts ADD COLUMN comment_count INTEGER DEFAULT 0')
                 self.logger.info("Added comment_count column to charts")
+            if 'not_recommend_count' not in chart_columns:
+                cursor.execute('ALTER TABLE charts ADD COLUMN not_recommend_count INTEGER DEFAULT NULL')
+                self.logger.info("Added not_recommend_count column to charts")
             if 'server_exists' not in chart_columns:
                 cursor.execute('ALTER TABLE charts ADD COLUMN server_exists INTEGER NOT NULL DEFAULT 1')
                 self.logger.info("Added server_exists column to charts")
@@ -445,11 +505,15 @@ class STBCrawler:
                 content TEXT,
                 talk_type INTEGER,
                 is_recommend INTEGER DEFAULT 0,
+                is_not_recommend INTEGER NOT NULL DEFAULT 0,
                 talk_time TIMESTAMP,
                 crawl_time TIMESTAMP NOT NULL,
                 FOREIGN KEY (cid) REFERENCES charts (cid)
             )
             ''')
+            comment_columns = {row[1] for row in cursor.execute('PRAGMA table_info(chart_comments)')}
+            if 'is_not_recommend' not in comment_columns:
+                cursor.execute('ALTER TABLE chart_comments ADD COLUMN is_not_recommend INTEGER NOT NULL DEFAULT 0')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_cid ON chart_comments(cid)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_chart_comments_time ON chart_comments(talk_time)')
 
@@ -464,15 +528,21 @@ class STBCrawler:
             # 测试访问排行榜页面（与主爬虫相同）
             test_url = BASE_URL + "/page/all/player?from=0&mode=0"
             self.logger.debug("测试连接: %s", test_url)
-            response = self.session.get(test_url, timeout=30)
+            response = self._get_with_progress("连接测试：排行榜", test_url, timeout=30)
             response.raise_for_status()
 
             self.log_request_details(test_url, response)
-            self.logger.info("[OK] 排行榜页面访问正常")
+            if is_login_page(response.text, getattr(response, "url", "")):
+                self.auth_required_detected = True
+                self.logger.warning("排行榜登录失效，请更新本地凭据")
+            else:
+                self.logger.info("[OK] 排行榜页面内容有效")
 
             # 测试访问主页
             self.logger.debug("测试主页: %s", HOMEPAGE_URL)
-            response = self.session.get(HOMEPAGE_URL, timeout=30)
+            response = self._get_with_progress(
+                "连接测试：主页", HOMEPAGE_URL, timeout=30
+            )
             response.raise_for_status()
 
             self.log_request_details(HOMEPAGE_URL, response)
@@ -481,7 +551,7 @@ class STBCrawler:
                 self.home_source_unavailable = True
                 self.logger.warning(
                     "主页请求被重定向到 %s，主页源将被跳过。建议使用 --source newapi（不依赖旧首页结构）。",
-                    redirected_host
+                    redirected_host,
                 )
             elif self._is_spa_shell_page(response.text):
                 self.home_source_unavailable = True
@@ -491,32 +561,35 @@ class STBCrawler:
 
             # 探测需要登录态的页面，便于给出明确提示
             latest_probe_url = BASE_URL + "/page/latest"
-            latest_probe_resp = self.session.get(latest_probe_url, timeout=30)
+            latest_probe_resp = self._get_with_progress(
+                "连接测试：最近变动和登录状态", latest_probe_url, timeout=30
+            )
             if latest_probe_resp.status_code == 403:
                 self.auth_required_detected = True
                 self.logger.warning(
                     "检测到 %s 返回 403（可能是风控/WAF拦截，而非本地未配置cookie）。建议优先使用 --source newapi。",
-                    latest_probe_url
+                    latest_probe_url,
                 )
             elif self._is_login_required_page(latest_probe_resp.text):
                 self.auth_required_detected = True
                 has_local_cookies = self._has_auth_cookies()
                 self.logger.warning(
                     "检测到 %s 返回登录页。%s若仅抓新接口可直接使用 --source newapi。",
-                    latest_probe_url
-                    ,
-                    "已检测到本地存在 sessionid/csrftoken，但登录态可能失效或被风控拦截；"
-                    if has_local_cookies
-                    else "若需完整旧站STB抓取，请配置 sessionid/csrftoken；"
+                    latest_probe_url,
+                    (
+                        "已检测到本地存在 sessionid/csrftoken，但登录态可能失效或被风控拦截；"
+                        if has_local_cookies
+                        else "若需完整旧站STB抓取，请配置 sessionid/csrftoken；"
+                    ),
                 )
 
-            self.logger.info("连接测试全部通过")
+            self.logger.info("网络可达；登录有效性=%s", not self.auth_required_detected)
             return True
 
         except requests.exceptions.RequestException as e:
             self.logger.error("连接测试失败: %s", e)
-            if hasattr(e, 'response') and e.response is not None:
-                self.log_request_details(getattr(e, 'url', '未知'), e.response)
+            if hasattr(e, "response") and e.response is not None:
+                self.log_request_details(getattr(e, "url", "未知"), e.response)
 
             self.logger.info("尝试备用连接测试...")
             return self.fallback_connection_test()
@@ -525,7 +598,7 @@ class STBCrawler:
         """备用连接测试方法"""
         try:
             # 只测试基础连接
-            response = self.session.get(BASE_URL, timeout=30)
+            response = self._get_with_progress("备用连接测试", BASE_URL, timeout=30)
             response.raise_for_status()
             self.logger.info("备用连接测试成功")
             return True
@@ -534,84 +607,48 @@ class STBCrawler:
             return False
 
     def search_charts(self, mode=None, status=2, count=18, page=0, key="", creator=""):
-        """搜索谱面API"""
         if not self._has_auth_cookies():
             self.auth_required_detected = True
-            self.logger.warning("API搜索跳过：缺少 sessionid/csrftoken。")
             return None
-
+        # The real chart-list frontend sends query parameters. The legacy POST
+        # returns the default Stable list while ignoring body filters.
         params = {
             "status": status,
             "count": count,
             "page": page,
             "key": key,
-            "creator": creator
+            "creator": creator,
+            "tag": 0,
+            "free": 1,
         }
-
         if mode is not None:
             params["mode"] = mode
-
-        self.logger.info("搜索谱面 - 模式: %s, 状态: %s, 页数: %s", mode, status, page)
-        self.logger.debug("搜索参数: %s", params)
-
         try:
-            # 添加CSRF token到表单数据
-            data = params.copy()
-            if 'csrftoken' in COOKIES:
-                data['csrfmiddlewaretoken'] = COOKIES['csrftoken']
-                self.logger.debug("添加CSRF token: %s", COOKIES['csrftoken'][:10])
-
-            # API请求headers - 增强版
-            api_headers = {
-                "Content-Type": "application/x-www-form-urlencoded",
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE_URL,
-                "Referer": BASE_URL + "/",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-
-            # 添加CSRF token到headers
-            if 'csrftoken' in COOKIES:
-                api_headers['X-CSRFToken'] = COOKIES['csrftoken']
-                api_headers['X-CSRF-Token'] = COOKIES['csrftoken']
-
-            self.logger.debug("发送API请求到: %s", SEARCH_API_URL)
-            self.logger.debug("请求头: %s", api_headers)
-            response = self.session.post(SEARCH_API_URL, data=data, headers=api_headers, timeout=30)
+            response = self._get_with_progress(
+                f"谱面搜索 mode={mode} status={status} page={page}",
+                SEARCH_API_URL,
+                params=params,
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": BASE_URL + "/page/all/chart",
+                },
+                timeout=30,
+            )
             response.raise_for_status()
-
-            self.log_request_details(SEARCH_API_URL, response, "POST")
-
-            # 检查响应内容类型
-            content_type = response.headers.get('content-type', '')
-            self.logger.debug("响应内容类型: %s", content_type)
-
-            if 'application/json' in content_type:
-                result = response.json()
-                normalized = self._normalize_search_result(result)
-                self.logger.info("API搜索成功 - 获取到 %d 个谱面", len(normalized.get("list", [])))
-                return normalized
-            else:
-                # 尝试解析非JSON响应
-                try:
-                    result = response.json()
-                    normalized = self._normalize_search_result(result)
-                    self.logger.info("API搜索成功(非标准Content-Type) - 获取到 %d 个谱面", len(normalized.get("list", [])))
-                    return normalized
-                except:
-                    self.logger.warning("API返回非JSON响应: %s", content_type)
-                    self.logger.debug("响应内容前500字符: %s", response.text[:500])
-                    return None
-
-        except requests.exceptions.RequestException as e:
-            self.logger.error("搜索谱面失败: %s", e)
-            if hasattr(e, 'response') and e.response is not None:
-                if e.response.status_code == 403:
-                    self.api_forbidden_detected = True
-                    self.auth_required_detected = True
-                    self.logger.warning("API返回403，通常表示登录态无效或缺失。")
-                self.log_request_details(SEARCH_API_URL, e.response, "POST")
+            if is_login_page(response.text, getattr(response, "url", "")):
+                self.auth_required_detected = True
+                return None
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("code", 0) != 0:
+                raise ValueError("Invalid chart search response")
+            body = payload.get("data", payload)
+            if not isinstance(body, dict) or not isinstance(body.get("list"), list):
+                raise ValueError("Missing chart search list")
+            return self._normalize_search_result(payload)
+        except (requests.RequestException, ValueError) as exc:
+            self.logger.warning("Chart search failed: %s", type(exc).__name__)
+            if getattr(getattr(exc, "response", None), "status_code", None) == 403:
+                self.api_forbidden_detected = True
             return None
 
     def _normalize_search_result(self, result):
@@ -664,25 +701,30 @@ class STBCrawler:
         else:
             self._api_request_interval = 60.0 / requests_per_minute
             self._rate_limit_enabled = True
-            self.logger.info("API 速率限制已设置为 %.1f 秒/请求 (%d 请求/分钟)", 
-                           self._api_request_interval, requests_per_minute)
+            if hasattr(self.session, "_malody_limiter"):
+                self.session._malody_limiter["rpm"] = min(requests_per_minute, 30)
+            self.logger.info(
+                "API 速率限制已设置为 %.1f 秒/请求 (%d 请求/分钟)",
+                self._api_request_interval,
+                requests_per_minute,
+            )
 
     def _apply_api_rate_limit(self):
         """在发起 API 请求前应用速率限制"""
         if not self._rate_limit_enabled:
             return
-        
+
         current_time = time.time()
         time_since_last_request = current_time - self._last_api_request_time
-        
+
         if time_since_last_request < self._api_request_interval:
             wait_time = self._api_request_interval - time_since_last_request
             # 加入 5-15% 的随机抖动，防止规律性
             jitter = wait_time * (0.05 + 0.1 * random.random())
             total_wait = wait_time + jitter
-            self.logger.debug("API 速率限制：等待 %.2f 秒", total_wait)
+            self.logger.info("API 速率限制：等待 %.1f 秒后继续请求", total_wait)
             time.sleep(total_wait)
-        
+
         self._last_api_request_time = time.time()
 
     def _new_api_ensure_guest_auth(self, force_refresh=False):
@@ -691,7 +733,9 @@ class STBCrawler:
 
         url = NEW_API_BASE_URL + "/web/auth/guest/wt"
         for attempt in range(3):
-            resp = self.session.get(url, headers=self._new_api_headers(), timeout=30)
+            resp = self._get_with_progress(
+                "新官网API：访客鉴权", url, headers=self._new_api_headers(), timeout=30
+            )
             resp.raise_for_status()
             try:
                 data = self._parse_new_api_json(resp, "/web/auth/guest/wt")
@@ -723,14 +767,25 @@ class STBCrawler:
     def _new_api_get(self, path, params=None, use_store_key=False, retry_on_auth=True):
         # 应用速率限制
         self._apply_api_rate_limit()
-        
+
         auth = self._new_api_ensure_guest_auth()
         request_params = dict(params or {})
         request_params.setdefault("uid", auth["uid"])
         request_params.setdefault("key", auth["store_key"] if use_store_key else auth["key"])
 
         url = NEW_API_BASE_URL + (path if path.startswith("/") else f"/{path}")
-        resp = self.session.get(url, params=request_params, headers=self._new_api_headers(), timeout=30)
+        identifiers = " ".join(
+            f"{name}={request_params[name]}"
+            for name in ("cid", "sid", "from")
+            if name in request_params
+        )
+        resp = self._get_with_progress(
+            f"新官网API：{path} {identifiers}".rstrip(),
+            url,
+            params=request_params,
+            headers=self._new_api_headers(),
+            timeout=30,
+        )
         resp.raise_for_status()
         data = self._parse_new_api_json(resp, path)
 
@@ -741,83 +796,160 @@ class STBCrawler:
         return data
 
     def _is_recommend_talk_item(self, item: Dict[str, Any]) -> bool:
-        talk_type = item.get("type")
-        if talk_type == 1 or str(talk_type) == "1":
-            return True
-        content = str(item.get("content") or "").strip().lower()
-        return content.startswith("recommend")
+        return classify_chart_vote(item) == "recommend"
+
+    def _fetch_not_recommend_count(self, cid):
+        """Read current negative votes, never infer a total from a partial feed."""
+        try:
+            payload = self._new_api_get("/community/chart/info", {"cid": cid})
+            if payload.get("code") == 0 and payload.get("cid") == int(cid):
+                return nonnegative_count(payload.get("dislike"))
+        except (requests.RequestException, RuntimeError, ValueError, TypeError) as exc:
+            self.logger.warning("不推荐总数获取失败 cid=%s，保留已有值: %s", cid, exc)
+        return None
 
     def _fetch_chart_talk_items(
-        self,
-        cid: int,
-        max_pages: int = TALK_FETCH_MAX_PAGES,
-        max_items: int = TALK_FETCH_MAX_ITEMS,
-    ) -> List[Dict[str, Any]]:
-        key = f"chart_{cid}"
-        params: Dict[str, Any] = {"key": key, "order": -1}
-        items: List[Dict[str, Any]] = []
-        seen_tids = set()
-        last_start = None
-
-        for _ in range(max_pages):
+        self, cid, max_pages=TALK_FETCH_MAX_PAGES, max_items=TALK_FETCH_MAX_ITEMS
+    ):
+        params = {"key": f"chart_{cid}", "order": -1}
+        generation = uuid.uuid4().hex
+        generation_started_at = now()
+        try:
+            row = (
+                self.db_manager.get_connection()
+                .execute(
+                    "SELECT complete,detail FROM crawl_observations WHERE entity='charts' AND object_id=? AND section='comments'",
+                    (str(cid),),
+                )
+                .fetchone()
+            )
+            state = json.loads(row[1] or "{}") if row and not row[0] else {}
+            if state and state.get("generation"):
+                generation = state["generation"]
+                generation_started_at = state.get("started_at", generation_started_at)
+                if state.get("cursor") is not None:
+                    params["start"] = state["cursor"]
+        except (AttributeError, sqlite3.Error, TypeError, ValueError):
+            pass
+        result = FetchList()
+        result.generation = generation
+        result.generation_started_at = generation_started_at
+        seen = set()
+        previous_cursor = params.get("start")
+        for page_index in range(max_pages or 1000000):
+            if self._should_stop():
+                result.error = "stopped"
+                break
             try:
-                talk_headers = {
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": CHART_URL.format(cid=cid),
-                }
-                resp = self.session.get(TALK_LIST_URL, params=params, headers=talk_headers, timeout=30)
-                resp.raise_for_status()
-                payload = resp.json()
-            except Exception as e:
-                self.logger.debug("拉取谱面 talk 失败 cid=%s: %s", cid, e)
+                if getattr(self, "_rate_limit_enabled", False):
+                    self._apply_api_rate_limit()
+                response = self._get_with_progress(
+                    f"评论/推荐 CID={cid} 第 {page_index + 1} 页",
+                    TALK_LIST_URL,
+                    params=params,
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": CHART_URL.format(cid=cid),
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict) or payload.get("code", 0) != 0:
+                    raise ValueError("Invalid talk response")
+                # The official talk UI treats {"code": 0} as an empty result.
+                if payload == {"code": 0}:
+                    result.complete = True
+                    result.cursor = None
+                    self.logger.info(
+                        "评论/推荐 CID=%s 第 %d 页：空列表，已到末页",
+                        cid,
+                        page_index + 1,
+                    )
+                    break
+                data = (
+                    payload.get("data")
+                    if isinstance(payload.get("data"), dict)
+                    else payload
+                )
+                items = data.get("list")
+                if not isinstance(items, list):
+                    raise ValueError("Missing talk list")
+                # The source omits `next` on terminal pages; the UI uses its truthiness.
+                has_more = bool(data.get("next"))
+                for item in items:
+                    if (
+                        not isinstance(item, dict)
+                        or item.get("tid") is None
+                        or item.get("time") is None
+                    ):
+                        raise ValueError("Invalid talk item")
+                    if item["tid"] not in seen:
+                        seen.add(item["tid"])
+                        result.append(item)
+                self.logger.info(
+                    "评论/推荐 CID=%s 第 %d 页：%d 条，本次累计 %d 条，%s",
+                    cid,
+                    page_index + 1,
+                    len(items),
+                    len(result),
+                    "还有下一页" if has_more else "已到末页",
+                )
+                if not has_more:
+                    result.complete = True
+                    result.cursor = None
+                    break
+                if not items:
+                    raise ValueError("Empty page claims more data")
+                # The endpoint uses strict time < start. Include the entire
+                # boundary second again, and reject a cursor that cannot advance.
+                cursor = min(int(item["time"]) for item in items) + 1
+                if previous_cursor is not None and cursor >= int(previous_cursor):
+                    result.error = "ambiguous_time_cursor"
+                    result.cursor = cursor
+                    break
+                previous_cursor = cursor
+                params["start"] = cursor
+                result.cursor = cursor
+                if max_items and len(result) >= max_items:
+                    result.error = "item_limit"
+                    break
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                result.error = self._request_error_text(exc)
+                result.cursor = params.get("start")
                 break
-
-            # Compatible with both legacy payload shapes:
-            # 1) {"code":0,"data":{"list":[...],"next":...}}
-            # 2) {"list":[...],"next":...}
-            data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-            if isinstance(payload, dict) and "code" in payload and payload.get("code") not in (0, None):
-                break
-
-            talk_list = data.get("list") or []
-            if not talk_list:
-                break
-
-            next_start = None
-            for item in talk_list:
-                tid = item.get("tid")
-                if tid in seen_tids:
-                    continue
-                seen_tids.add(tid)
-                items.append(item)
-                next_start = item.get("time")
-                if len(items) >= max_items:
-                    return items
-
-            if not data.get("next"):
-                break
-            if next_start is None:
-                break
-
-            next_start = int(next_start)
-            if last_start is not None and next_start >= last_start:
-                break
-            last_start = next_start
-            params["start"] = next_start - 1
-
-        return items
+        if not result.complete and result.error is None:
+            result.error = "page_limit"
+        if not result.complete:
+            self.logger.warning(
+                "评论/推荐 CID=%s 尚未抓全：%s；本次获取 %d 条，保留已有数据和分页进度",
+                cid,
+                result.error,
+                len(result),
+            )
+        return result
 
     def _build_chart_social_data(self, cid: int):
         talk_items = self._fetch_chart_talk_items(cid)
         recommend_count = 0
         comment_count = 0
-        normalized_items = []
+        normalized_items = FetchList(
+            complete=getattr(talk_items, "complete", False),
+            error=getattr(talk_items, "error", None),
+            cursor=getattr(talk_items, "cursor", None),
+        )
+        normalized_items.generation = getattr(talk_items, "generation", None)
+        normalized_items.generation_started_at = getattr(
+            talk_items, "generation_started_at", None
+        )
 
         for item in talk_items:
-            is_recommend = self._is_recommend_talk_item(item)
+            vote = classify_chart_vote(item)
+            is_recommend = vote == "recommend"
+            is_not_recommend = vote == "not_recommend"
             if is_recommend:
                 recommend_count += 1
-            else:
+            elif not is_not_recommend and str(item.get("type")) != "1":
                 comment_count += 1
 
             talk_time = item.get("time")
@@ -837,680 +969,616 @@ class STBCrawler:
                     "content": item.get("content"),
                     "talk_type": item.get("type"),
                     "is_recommend": 1 if is_recommend else 0,
+                    "is_not_recommend": 1 if is_not_recommend else 0,
                     "talk_time": talk_time_dt,
                 }
             )
 
         return recommend_count, comment_count, normalized_items
 
-    def _save_chart_comments(self, cursor, cid: int, comment_items: List[Dict[str, Any]], crawl_time: datetime):
-        cursor.execute("DELETE FROM chart_comments WHERE cid = ?", (cid,))
-        if not comment_items:
-            return
-        cursor.executemany(
-            '''
-            INSERT OR REPLACE INTO chart_comments
-            (tid, cid, uid, name, content, talk_type, is_recommend, talk_time, crawl_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''',
-            [
+    def _save_chart_comments(self, cursor, cid, comment_items, crawl_time):
+        from crawlers.ingestion import time_text
+
+        generation = getattr(comment_items, "generation", None)
+        started_at = time_text(
+            getattr(comment_items, "generation_started_at", None) or crawl_time
+        )
+        prior = cursor.execute(
+            "SELECT observed_at FROM crawl_observations WHERE entity='charts' AND object_id=? AND section='comments'",
+            (str(cid),),
+        ).fetchone()
+        if prior and started_at < time_text(prior[0]):
+            raise ValueError(
+                "Stale comment generation; refetch instead of replacing newer data"
+            )
+        for item in comment_items:
+            if item.get("tid") is None:
+                continue
+            existing = cursor.execute(
+                "SELECT cid FROM chart_comments WHERE tid=?", (item["tid"],)
+            ).fetchone()
+            if existing and int(existing[0]) != int(cid):
+                raise ValueError("Talk ID belongs to a different chart")
+            cursor.execute(
+                """INSERT INTO chart_comments(tid,cid,uid,name,content,talk_type,is_recommend,is_not_recommend,talk_time,crawl_time,is_current,seen_generation)
+                VALUES(?,?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(tid) DO UPDATE SET
+                uid=excluded.uid,name=excluded.name,content=excluded.content,talk_type=excluded.talk_type,
+                is_recommend=excluded.is_recommend,is_not_recommend=excluded.is_not_recommend,
+                talk_time=excluded.talk_time,crawl_time=excluded.crawl_time,is_current=1,seen_generation=excluded.seen_generation
+                WHERE chart_comments.cid=excluded.cid AND excluded.crawl_time>=chart_comments.crawl_time""",
                 (
-                    item.get("tid"),
+                    item["tid"],
                     cid,
                     item.get("uid"),
                     item.get("name"),
                     item.get("content"),
                     item.get("talk_type"),
                     item.get("is_recommend", 0),
+                    item.get("is_not_recommend", 0),
                     item.get("talk_time"),
-                    crawl_time,
-                )
-                for item in comment_items
-                if item.get("tid") is not None
-            ],
+                    started_at,
+                    generation,
+                ),
+            )
+        complete = bool(getattr(comment_items, "complete", False))
+        if complete and generation:
+            cursor.execute(
+                "UPDATE chart_comments SET is_current=0 WHERE cid=? AND (seen_generation IS NULL OR seen_generation!=?) AND crawl_time<=?",
+                (cid, generation, started_at),
+            )
+        observe(
+            self.db_manager.get_connection(),
+            "charts",
+            cid,
+            "comments",
+            "talk",
+            complete,
+            observed_at=started_at,
+            detail={
+                "generation": generation,
+                "started_at": started_at,
+                "cursor": getattr(comment_items, "cursor", None),
+                "error": getattr(comment_items, "error", None),
+            },
         )
 
     def _save_chart_data_from_new_api(self, chart_info, song_info, chart_hint=None):
         chart_hint = chart_hint or {}
-        sid = int(chart_info.get("sid") or song_info.get("sid") or 0)
-        cid = int(chart_info.get("cid") or chart_hint.get("cid") or 0)
-        if not sid or not cid:
+        cid = chart_info.get("cid", chart_hint.get("cid"))
+        sid = chart_info.get("sid", song_info.get("sid"))
+        if (
+            not cid
+            or not sid
+            or chart_info.get("code", 0) != 0
+            or song_info.get("code", 0) != 0
+        ):
             return False
-
-        version = chart_info.get("version") or chart_hint.get("version") or ""
-        level = chart_hint.get("level")
-        if level is None or level == "":
-            level_match = re.search(r'Lv\.?\s*(\d+)', version)
-            level = level_match.group(1) if level_match else ""
-        level = str(level) if level is not None else ""
-
-        ts = chart_hint.get("time") or chart_info.get("time")
-        last_updated = None
+        if chart_hint.get("cid") and int(chart_hint["cid"]) != int(cid):
+            return False
+        if song_info.get("sid") and int(song_info["sid"]) != int(sid):
+            return False
+        mode = chart_info.get("mode", chart_hint.get("mode"))
+        status = chart_info.get("type", chart_hint.get("type"))
+        if (
+            getattr(self, "mode_filter", None) is not None and mode not in self.mode_filter
+        ) or (
+            getattr(self, "status_filter", None) is not None
+            and status not in self.status_filter
+        ):
+            self.last_fetch_state = "filtered"
+            return False
+        version = chart_info.get("version", chart_hint.get("version"))
+        chart = {
+            "cid": int(cid),
+            "version": version,
+            "creator_uid": chart_info.get("uid", chart_hint.get("uid")),
+            "creator_name": chart_info.get("creator", chart_hint.get("creator")),
+            "stabled_by_uid": chart_info.get("publisherId"),
+            "stabled_by_name": chart_info.get("publisher"),
+            "mode": chart_info.get("mode", chart_hint.get("mode")),
+            "status": chart_info.get("type", chart_hint.get("type")),
+            "chart_length": chart_info.get("length", chart_hint.get("length")),
+            "level": chart_info.get("level", chart_hint.get("level")),
+            "heat": nonnegative_count(chart_info.get("hot", chart_hint.get("hot"))),
+            "love_count": nonnegative_count(chart_info.get("like")),
+            "recommend_count": nonnegative_count(chart_info.get("like")),
+            "not_recommend_count": nonnegative_count(chart_info.get("dislike")),
+            "comment_count": None,
+            "donate_count": None,
+            "play_count": None,
+            "last_updated": None,
+            "checksum": chart_info.get("checksum"),
+        }
+        if chart["level"] is not None:
+            chart["level"] = str(chart["level"])
+        ts = chart_hint.get("time", chart_info.get("time"))
         if ts:
             try:
-                last_updated = datetime.fromtimestamp(int(ts))
-            except Exception:
-                last_updated = None
-
-        cover_url = song_info.get("cover") or ""
-        if cover_url.startswith("/"):
-            cover_url = BASE_URL + cover_url
-
-        api_like_count = int(chart_info.get("like") or chart_hint.get("like") or 0)
-        api_hot_count = int(chart_info.get("hot") or chart_hint.get("hot") or 0)
-
-        chart_data = {
-            "cid": cid,
-            "version": version,
-            "creator_uid": chart_info.get("uid") or chart_hint.get("uid"),
-            "creator_name": chart_info.get("creator") or chart_hint.get("creator") or "",
-            "stabled_by_uid": chart_info.get("publisherId"),
-            "stabled_by_name": chart_info.get("publisher") or "",
-            "level": level,
-            "mode": int(chart_info.get("mode") if chart_info.get("mode") is not None else chart_hint.get("mode", 0)),
-            "chart_length": int(chart_info.get("length") or chart_hint.get("length") or 0),
-            "status": int(chart_info.get("type") if chart_info.get("type") is not None else chart_hint.get("type", 0)),
-            "heat": api_hot_count,
-            "love_count": api_like_count,
-            "recommend_count": api_like_count,
-            "comment_count": 0,
-            "donate_count": 0,
-            "play_count": 0,
-            "last_updated": last_updated,
+                chart["last_updated"] = datetime.fromtimestamp(int(ts)).isoformat()
+            except (ValueError, TypeError, OSError):
+                pass
+        song = {
+            "sid": int(sid),
+            "title": song_info.get("title", chart_info.get("title")),
+            "artist": song_info.get("artist", chart_info.get("artist")),
+            "title_org": song_info.get("titleOrg"),
+            "artist_org": song_info.get("artistOrg"),
+            "bpm": song_info.get("bpm"),
+            "length": song_info.get("length"),
+            "cover_url": song_info.get("cover"),
+            "last_updated": song_info.get("_song_last_updated"),
         }
-
-        song_data = {
-            "sid": sid,
-            "title": song_info.get("title") or chart_info.get("title") or "",
-            "artist": song_info.get("artist") or chart_info.get("artist") or "",
-            "bpm": float(song_info.get("bpm") or 0),
-            "length": int(song_info.get("length") or chart_info.get("length") or 0),
-            "cover_url": cover_url,
+        if song["cover_url"] and song["cover_url"].startswith("/"):
+            song["cover_url"] = BASE_URL + song["cover_url"]
+        try:
+            if getattr(self, "_rate_limit_enabled", False):
+                self._apply_api_rate_limit()
+            response = self._get_with_progress(
+                f"谱面 CID={cid} 的页面指标和标签",
+                CHART_URL.format(cid=cid),
+                timeout=30,
+            )
+            response.raise_for_status()
+            extra_chart, extra_song = self.parse_chart_page(response.text, int(cid))
+            page_metrics = parse_chart_metrics(response.text)
+            for field in ("donate_count", "play_count"):
+                if field in page_metrics:
+                    chart[field] = page_metrics[field]
+            if extra_chart and extra_chart.get("tags_json") is not None:
+                chart["tags_json"] = extra_chart["tags_json"]
+        except requests.RequestException as exc:
+            self.logger.warning("Optional HTML counters unavailable cid=%s: %s", cid, exc)
+        for record in (chart, song):
+            record["_present"] = [k for k, v in record.items() if v is not None]
+            record["_source"] = "newapi"
+            record["_observed_at"] = now()
+            record["_complete"] = True
+        chart["_field_sources"] = {
+            field: "page_chart"
+            for field in ("donate_count", "play_count", "tags_json")
+            if chart.get(field) is not None
         }
-
-        rec_count, cmt_count, talk_items = self._build_chart_social_data(cid)
-        # Primary source: official API like count; fallback/补充: talk stream recommend items.
-        chart_data["recommend_count"] = max(chart_data["recommend_count"], rec_count)
-        chart_data["comment_count"] = cmt_count
-
-        success = self.save_chart_data(chart_data, song_data, talk_items=talk_items)
+        chart["_source_time"] = chart["last_updated"]
+        song["_source_time"] = song.get("last_updated")
+        _, _, items = self._build_chart_social_data(int(cid))
+        success = self.save_chart_data(chart, song, talk_items=items)
         if success:
-            self.processed_charts.add(cid)
-            self.processed_songs.add(sid)
+            self.processed_charts.add(int(cid))
         return success
 
-    def crawl_from_new_api(self, max_charts=60, max_songs=600):
-        """通过新官网 API 抓取谱面（不依赖旧官网页面结构）。"""
-        self.logger.info("=== 开始方式4: 通过新官网API抓取 ===")
-        self.logger.info("目标: 最多 %d 个谱面, 最多扫描 %d 首歌曲", max_charts, max_songs)
-        
-        # 启用 API 速率限制（默认 60 请求/分钟）
-        self.set_api_rate_limit(requests_per_minute=60)
-
-        try:
-            self._new_api_ensure_guest_auth()
-        except Exception as e:
-            self.logger.warning("新官网API鉴权失败，跳过该数据源: %s", e)
-            return -1
-
-        success_count = 0
-        sid_count = 0
-        from_offset = 0
-        seen_sids = set()
-        song_info_cache = {}
-
-        while not self._should_stop() and success_count < max_charts and sid_count < max_songs:
-            if self._consume_skip("newapi source"):
+    def crawl_from_new_api(self, max_charts=60, max_songs=600, modes=None, statuses=None):
+        self.mode_filter, self.status_filter = modes, statuses
+        self.logger.info(
+            "开始新官网API爬取：本轮最多保存 %d 个谱面；每个谱面需要歌曲、页面和评论等多个请求",
+            max_charts,
+        )
+        self._new_api_ensure_guest_auth()
+        conn = self.db_manager.get_connection()
+        scope = "newapi:" + json.dumps(
+            {
+                "modes": sorted(modes) if modes is not None else None,
+                "statuses": sorted(statuses) if statuses is not None else None,
+            },
+            sort_keys=True,
+        )
+        store = TaskStore(conn, scope)
+        self.logger.info("新官网API持久任务队列：%s", store.counts())
+        row = conn.execute(
+            "SELECT detail FROM crawl_observations WHERE entity='discovery' AND object_id=? AND section='cursor'",
+            (scope,),
+        ).fetchone()
+        discovery = json.loads(row[0] or "{}") if row else {"offset": 0, "complete": False}
+        if discovery.get("complete") and not any(
+            v for k, v in store.counts().items() if k not in ("done", "not_found")
+        ):
+            with atomic(conn):
+                conn.execute("DELETE FROM crawl_tasks WHERE scope=?", (scope,))
+            discovery = {"offset": 0, "complete": False}
+        if not discovery.get("complete") and not self._should_stop():
+            self.logger.info(
+                "发现歌曲：读取商店列表，游标=%s", discovery.get("offset", 0)
+            )
+            response = self._new_api_get(
+                "/store/list2",
+                {"from": discovery.get("offset", 0), "type": 0},
+                use_store_key=True,
+            )
+            if response.get("code") != 0 or not isinstance(response.get("data"), list):
+                self.logger.error(
+                    "商店列表无效：code=%s，data 类型=%s；保留原进度",
+                    response.get("code"),
+                    type(response.get("data")).__name__,
+                )
+                return -1 if response.get("code") == -1000 else 0
+            if "hasMore" not in response:
+                self.logger.error("商店列表缺少 hasMore 分页字段；保留原进度")
+                return 0
+            following = response.get(
+                "next", discovery.get("offset", 0) + len(response["data"])
+            )
+            if response.get("hasMore") and (
+                not response["data"]
+                or not isinstance(following, int)
+                or following <= discovery.get("offset", 0)
+            ):
+                self.logger.error(
+                    "Store discovery cursor stalled; preserving previous progress"
+                )
+                return 0
+            # Persist every discovered SID before fetching any of its chart lists.
+            with atomic(conn):
+                for song in response["data"]:
+                    if song.get("sid"):
+                        store.add("song", song["sid"])
+                next_offset = response.get("next")
+                discovery = {
+                    "offset": (
+                        next_offset
+                        if isinstance(next_offset, int)
+                        else discovery.get("offset", 0) + len(response["data"])
+                    ),
+                    "complete": not response.get("hasMore"),
+                }
+                observe(
+                    conn,
+                    "discovery",
+                    scope,
+                    "cursor",
+                    "newapi",
+                    discovery["complete"],
+                    detail=discovery,
+                )
+            self.logger.info(
+                "商店列表已记录 %d 条歌曲，下一游标=%s，%s",
+                len(response["data"]),
+                discovery["offset"],
+                "歌曲发现已完成" if discovery["complete"] else "后续列表将在下轮继续",
+            )
+        success = 0
+        attempts = 0
+        while (
+            attempts < max_charts + max_songs
+            and success < max_charts
+            and not self._should_stop()
+        ):
+            if self._consume_skip("new API source"):
                 break
+            claimed = store.claim(1)
+            if not claimed:
+                self.logger.info("新官网API暂无可立即执行的任务：%s", store.counts())
+                break
+            kind, object_id, payload = claimed[0]
+            attempts += 1
+            started = time.monotonic()
+            self.logger.info(
+                "新官网API任务 %d：%s ID=%s（本轮已保存谱面 %d/%d）",
+                attempts,
+                kind,
+                object_id,
+                success,
+                max_charts,
+            )
             try:
-                songs_resp = self._new_api_get("/store/list2", {"from": from_offset, "type": 0}, use_store_key=True)
-            except Exception as e:
-                self.logger.warning("新官网API读取歌曲列表失败: %s", e)
-                break
-
-            if songs_resp.get("code") != 0:
-                self.logger.warning("新官网API歌曲列表返回异常 code=%s", songs_resp.get("code"))
-                break
-
-            songs = songs_resp.get("data") or []
-            if not songs:
-                break
-
-            for song in songs:
-                if self._consume_skip("newapi source"):
-                    break
-                if self._should_stop() or success_count >= max_charts or sid_count >= max_songs:
-                    break
-
-                sid = song.get("sid")
-                if not sid:
+                if kind == "song":
+                    response = self._new_api_get(
+                        "/community/song/charts", {"sid": int(object_id)}
+                    )
+                    if response.get("code") != 0 or not isinstance(
+                        response.get("data"), list
+                    ):
+                        raise ValueError("Incomplete song list")
+                    matched = 0
+                    with atomic(conn):
+                        for hint in response["data"]:
+                            if modes is not None and hint.get("mode") not in modes:
+                                continue
+                            if statuses is not None and hint.get("type") not in statuses:
+                                continue
+                            store.add(
+                                "chart", hint["cid"], {"sid": int(object_id), "hint": hint}
+                            )
+                            matched += 1
+                    store.finish(kind, object_id)
+                    self.logger.info(
+                        "歌曲 SID=%s：发现 %d 个谱面，%d 个符合筛选条件并已记录任务，用时 %.1f 秒",
+                        object_id,
+                        len(response["data"]),
+                        matched,
+                        time.monotonic() - started,
+                    )
                     continue
-                sid = int(sid)
-                if sid in seen_sids:
-                    continue
-                seen_sids.add(sid)
-                sid_count += 1
-
-                try:
-                    charts_resp = self._new_api_get("/community/song/charts", {"sid": sid})
-                except Exception as e:
-                    self.logger.debug("新官网API读取SID %s 谱面失败: %s", sid, e)
-                    continue
-
-                if charts_resp.get("code") != 0:
-                    continue
-                chart_list = charts_resp.get("data") or []
-                if not chart_list:
-                    continue
-
-                if sid not in song_info_cache:
-                    song_info_resp = self._new_api_get("/community/song/info", {"sid": sid})
-                    song_info_cache[sid] = song_info_resp if song_info_resp.get("code") == 0 else None
-                song_info = song_info_cache.get(sid)
-                if not song_info:
-                    continue
-
-                for chart_hint in chart_list:
-                    if self._consume_skip("newapi source"):
-                        break
-                    if self._should_stop() or success_count >= max_charts:
-                        break
-                    cid = chart_hint.get("cid")
-                    if not cid:
-                        continue
-                    cid = int(cid)
-                    if cid in self.processed_charts:
-                        continue
-
-                    chart_info_resp = self._new_api_get("/community/chart/info", {"cid": cid})
-                    if chart_info_resp.get("code") != 0:
-                        continue
-
-                    if self._save_chart_data_from_new_api(chart_info_resp, song_info, chart_hint):
-                        success_count += 1
-                        self.logger.info("[OK] 新官网API抓取谱面成功 cid=%s (进度 %d/%d)", cid, success_count, max_charts)
+                if kind == "comments":
+                    _, _, items = self._build_chart_social_data(int(object_id))
+                    with atomic(conn):
+                        self._save_chart_comments(
+                            conn.cursor(), int(object_id), items, now()
+                        )
+                        if getattr(items, "complete", False):
+                            count = conn.execute(
+                                "SELECT COUNT(*) FROM chart_comments WHERE cid=? AND is_current=1 AND is_recommend=0 AND is_not_recommend=0 AND (talk_type IS NULL OR talk_type!=1)",
+                                (object_id,),
+                            ).fetchone()[0]
+                            conn.execute(
+                                "UPDATE charts SET comment_count=? WHERE cid=?",
+                                (count, object_id),
+                            )
+                    store.finish(
+                        kind,
+                        object_id,
+                        state="done" if getattr(items, "complete", False) else "retry",
+                        error=getattr(items, "error", None),
+                    )
+                    if getattr(items, "complete", False):
+                        self.logger.info(
+                            "评论/推荐 CID=%s 已完整保存，本次 %d 条",
+                            object_id,
+                            len(items),
+                        )
                     else:
-                        self.logger.warning("[FAIL] 新官网API保存谱面失败 cid=%s", cid)
-                    time.sleep(0.2)
-
-            next_offset = songs_resp.get("next")
-            has_more = bool(songs_resp.get("hasMore"))
-            if not has_more:
-                break
-            if isinstance(next_offset, int) and next_offset > from_offset:
-                from_offset = next_offset
-            else:
-                from_offset += len(songs)
-
-        self.logger.info("方式4完成: 成功 %d/%d 个谱面", success_count, max_charts)
-        return success_count
+                        self.logger.warning(
+                            "评论/推荐 CID=%s 待补抓，60 秒后可重试：%s",
+                            object_id,
+                            getattr(items, "error", None),
+                        )
+                    continue
+                info = self._new_api_get("/community/chart/info", {"cid": int(object_id)})
+                if info.get("code") != 0:
+                    raise ValueError("Chart detail unavailable")
+                song = self._new_api_get("/community/song/info", {"sid": payload["sid"]})
+                ids = self.get_charts_from_song_page(payload["sid"])
+                if getattr(ids, "song_last_updated", None):
+                    song["_song_last_updated"] = ids.song_last_updated
+                if not self._save_chart_data_from_new_api(info, song, payload.get("hint")):
+                    if getattr(self, "last_fetch_state", None) == "filtered":
+                        store.finish(kind, object_id)
+                        self.logger.info(
+                            "谱面 CID=%s 不符合筛选条件，已跳过", object_id
+                        )
+                        continue
+                    raise ValueError("Chart not saved")
+                success += 1
+                store.finish(kind, object_id)
+                if not self.last_social_complete:
+                    with atomic(conn):
+                        store.add("comments", object_id)
+                self.logger.info(
+                    "已保存谱面 CID=%s（本轮 %d/%d），用时 %.1f 秒；%s",
+                    object_id,
+                    success,
+                    max_charts,
+                    time.monotonic() - started,
+                    (
+                        "评论/推荐完整"
+                        if self.last_social_complete
+                        else "评论/推荐待补抓，已加入持久任务队列"
+                    ),
+                )
+            except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+                error = self._request_error_text(exc)
+                store.finish(kind, object_id, state="retry", error=error)
+                self.logger.warning(
+                    "新官网API任务失败：%s ID=%s，用时 %.1f 秒；已保留任务，60 秒后可重试：%s",
+                    kind,
+                    object_id,
+                    time.monotonic() - started,
+                    error,
+                )
+        self.logger.info(
+            "新官网API本轮结束：保存谱面 %d/%d，处理任务 %d 个，队列状态：%s",
+            success,
+            max_charts,
+            attempts,
+            store.counts(),
+        )
+        return success
 
     def parse_chart_page(self, html, cid):
-        """增强的谱面页面解析，确保能提取SID"""
-        self.logger.info("开始解析谱面页面: cid=%s", cid)
-
         soup = BeautifulSoup(html, "html.parser")
-
-        # 提取基础信息
-        chart_data = {
-            "cid": cid,
-            "version": "",
-            "creator_uid": None,
-            "creator_name": "",
-            "stabled_by_uid": None,
-            "stabled_by_name": "",
-            "level": "",
-            "mode": 0,
-            "chart_length": 0,
-            "status": 0,
-            "heat": 0,
-            "love_count": 0,
-            "recommend_count": 0,
-            "comment_count": 0,
-            "donate_count": 0,
-            "play_count": 0,
-            "last_updated": None
-        }
-
-        song_data = {
-            "sid": None,
-            "title": "",
-            "artist": "",
-            "bpm": 0,
-            "length": 0,
-            "cover_url": ""
-        }
-
-        try:
-            # 方法1: 从JavaScript变量中提取SID
-            script_text = soup.find('script', string=re.compile(r'window\.malody'))
-            if script_text:
-                # 查找sid
-                sid_match = re.search(r'sid\s*:\s*(\d+)', script_text.string)
-                if sid_match:
-                    song_data["sid"] = int(sid_match.group(1))
-                    self.logger.debug("从JS提取到SID: %s", song_data["sid"])
-
-            # 方法2: 从封面URL提取SID
-            if not song_data["sid"]:
-                cover_div = soup.select_one('.song_title .cover')
-                if cover_div and 'style' in cover_div.attrs:
-                    style = cover_div['style']
-                    url_match = re.search(r'url\((.*?)\)', style)
-                    if url_match:
-                        cover_url = url_match.group(1)
-                        song_data["cover_url"] = cover_url
-                        # 从封面URL提取SID
-                        sid_match = re.search(r'/(\d+)!', cover_url)
-                        if sid_match:
-                            song_data["sid"] = int(sid_match.group(1))
-                            self.logger.debug("从封面URL提取SID: %s", song_data["sid"])
-
-            # 方法3: 从页面链接中提取SID
-            if not song_data["sid"]:
-                for link in soup.find_all('a', href=True):
-                    href = link['href']
-                    if '/song/' in href:
-                        sid_match = re.search(r'/song/(\d+)', href)
-                        if sid_match:
-                            song_data["sid"] = int(sid_match.group(1))
-                            self.logger.debug("从链接提取SID: %s", song_data["sid"])
-                            break
-
-            # 方法4: 从面包屑导航或其他元素中提取
-            if not song_data["sid"]:
-                # 查找包含歌曲ID的元素
-                sid_elements = soup.find_all(text=re.compile(r'[Ss]ong[ _-]?[IiDd]'))
-                for element in sid_elements:
-                    sid_match = re.search(r'(\d+)', element)
-                    if sid_match:
-                        song_data["sid"] = int(sid_match.group(1))
-                        self.logger.debug("从文本提取SID: %s", song_data["sid"])
-                        break
-
-            # 如果仍然没有SID，记录详细信息用于调试
-            if not song_data["sid"]:
-                self.logger.warning("无法提取SID (cid=%s)，保存页面用于分析", cid)
-                debug_file = f"logs/debug_cid_{cid}_no_sid.html"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(html)
-                self.logger.info("已保存页面到: %s", debug_file)
-
-            # 记录页面基本信息
-            title_tag = soup.select_one('title')
-            if title_tag:
-                self.logger.debug("页面标题: %s", title_tag.get_text())
-
-            # 从JavaScript变量中提取cid
-            if script_text:
-                cid_match = re.search(r'cid:(\d+)', script_text.string)
-                if cid_match:
-                    chart_data["cid"] = int(cid_match.group(1))
-                    self.logger.debug("从JS提取到CID: %s", chart_data["cid"])
-            else:
-                self.logger.debug("未找到window.malody脚本")
-
-            # 修复：提取状态 - 同时检查t1和t2类
-            status_tag = None
-            # 先尝试t1类（Beta状态使用）
-            status_tag = soup.select_one('.song_title .title em.t1')
-            # 如果没有找到t1，尝试t2类（Stable状态使用）
-            if not status_tag:
-                status_tag = soup.select_one('.song_title .title em.t2')
-            # 如果还没有找到，尝试查找任何em标签
-            if not status_tag:
-                status_tag = soup.select_one('.song_title .title em')
-
-            if status_tag:
-                status_text = status_tag.get_text().strip()
-                chart_data["status"] = STATUS_MAP.get(status_text, 0)
-                self.logger.debug("提取状态: %s -> %s", status_text, chart_data["status"])
-            else:
-                self.logger.debug("未找到状态标签")
-                # 尝试从其他位置查找状态信息
-                status_elements = soup.find_all('em', class_=re.compile(r't[12]'))
-                for elem in status_elements:
-                    status_text = elem.get_text().strip()
-                    if status_text in STATUS_MAP:
-                        chart_data["status"] = STATUS_MAP[status_text]
-                        self.logger.debug("从备选位置提取状态: %s -> %s", status_text, chart_data["status"])
-                        break
-
-            # 提取标题和艺术家
-            title_tag = soup.select_one('.song_title .title')
-            if title_tag:
-                # 提取艺术家
-                artist_span = title_tag.find('span', class_='artist')
-                if artist_span:
-                    song_data["artist"] = artist_span.get_text().strip()
-                    self.logger.debug("提取艺术家: %s", song_data["artist"])
-                    artist_span.decompose()
-                else:
-                    self.logger.debug("未找到艺术家标签")
-
-                # 移除状态标签
-                for em in title_tag.find_all('em'):
-                    em.decompose()
-
-                # 提取标题文本
-                title_text = title_tag.get_text().strip()
-                if title_text.startswith(' - '):
-                    title_text = title_text[3:].strip()
-                song_data["title"] = title_text
-                self.logger.debug("提取标题: %s", song_data["title"])
-            else:
-                self.logger.warning("未找到标题区域")
-
-            # 提取版本和模式
-            mode_tag = soup.select_one('.song_title .mode')
-            if mode_tag:
-                version_spans = mode_tag.find_all('span')
-                if version_spans:
-                    chart_data["version"] = version_spans[0].get_text().strip()
-                    self.logger.debug("提取版本: %s", chart_data["version"])
-
-                # 提取模式
-                img_tag = mode_tag.find('img')
-                if img_tag and 'src' in img_tag.attrs:
-                    src = img_tag['src']
-                    mode_match = re.search(r'mode-(\d+)', src)
-                    if mode_match:
-                        chart_data["mode"] = int(mode_match.group(1))
-                        self.logger.debug("提取模式: %s", chart_data["mode"])
-                else:
-                    self.logger.debug("未找到模式图片")
-
-                # 提取等级
-                version_text = chart_data["version"]
-                level_match = re.search(r'Lv\.(\d+(?:\.\d+)?)', version_text)
-                if level_match:
-                    chart_data["level"] = level_match.group(1)
-                    self.logger.debug("提取等级: %s", chart_data["level"])
-            else:
-                self.logger.debug("未找到模式区域")
-
-            # 提取创作者信息
-            created_by_spans = [span for span in soup.find_all('span')
-                            if span.get_text().strip().startswith('Created by:')]
-
-            if created_by_spans:
-                created_by_span = created_by_spans[0]
-                # 查找紧随其后的创作者链接
-                creator_link = None
-                for sibling in created_by_span.next_siblings:
-                    if hasattr(sibling, 'name') and sibling.name == 'a':
-                        creator_link = sibling
-                        break
-
-                if creator_link and 'href' in creator_link.attrs:
-                    href = creator_link['href']
-                    uid_match = re.search(r'/accounts/user/(\d+)', href)
-                    if uid_match:
-                        chart_data["creator_uid"] = int(uid_match.group(1))
-                        chart_data["creator_name"] = creator_link.get_text().strip()
-                        self.logger.debug("提取创作者: %s (UID: %s)",
-                                        chart_data["creator_name"], chart_data["creator_uid"])
-            else:
-                self.logger.debug("未找到创作者信息")
-
-            # 提取稳定者信息
-            stabled_by_spans = [span for span in soup.find_all('span')
-                            if span.get_text().strip().startswith('Stabled by:')]
-
-            if stabled_by_spans:
-                stabled_by_span = stabled_by_spans[0]
-                # 查找紧随其后的稳定者链接
-                stabled_link = None
-                for sibling in stabled_by_span.next_siblings:
-                    if hasattr(sibling, 'name') and sibling.name == 'a':
-                        stabled_link = sibling
-                        break
-
-                if stabled_link and 'href' in stabled_link.attrs:
-                    href = stabled_link['href']
-                    uid_match = re.search(r'/accounts/user/(\d+)', href)
-                    if uid_match:
-                        chart_data["stabled_by_uid"] = int(uid_match.group(1))
-                        chart_data["stabled_by_name"] = stabled_link.get_text().strip()
-                        self.logger.debug("提取稳定者: %s (UID: %s)",
-                                        chart_data["stabled_by_name"], chart_data["stabled_by_uid"])
-            else:
-                self.logger.debug("未找到稳定者信息")
-
-            # 提取ID、长度、BPM、最后更新时间
-            sub_tag = soup.select_one('.song_title .sub')
-            if sub_tag:
-                sub_text = sub_tag.get_text()
-
-                # 使用正则表达式提取所有信息
-                # ID
-                id_match = re.search(r'ID\s*:c?(\d+)', sub_text)
-                if id_match:
-                    chart_data["cid"] = int(id_match.group(1))
-                    self.logger.debug("提取CID: %s", chart_data["cid"])
-
-                # 长度 - 修复：使用英文"Length"而不是中文"长度"
-                length_match = re.search(r'Length\s*:\s*(\d+)s', sub_text)
-                if length_match:
-                    length_value = int(length_match.group(1))
-                    chart_data["chart_length"] = length_value
-                    song_data["length"] = length_value
-                    self.logger.debug("提取长度: %s秒", length_value)
-
-                # BPM
-                bpm_match = re.search(r'BPM\s*:\s*(\d+(?:\.\d+)?)', sub_text)
-                if bpm_match:
-                    try:
-                        song_data["bpm"] = float(bpm_match.group(1))
-                        self.logger.debug("提取BPM: %s", song_data["bpm"])
-                    except ValueError:
-                        self.logger.warning("无法解析BPM值: %s", bpm_match.group(1))
-
-                # 最后更新时间 - 修复：使用英文"Last updated"而不是中文"最后更新"
-                date_match = re.search(r'Last updated\s*:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})', sub_text)
-                if date_match:
-                    try:
-                        chart_data["last_updated"] = datetime.strptime(date_match.group(1), "%Y-%m-%d %H:%M")
-                        self.logger.debug("提取最后更新时间: %s", chart_data["last_updated"])
-                    except ValueError:
-                        self.logger.warning("无法解析日期: %s", date_match.group(1))
-            else:
-                self.logger.debug("未找到详细信息区域")
-
-            # 提取热度信息 - 修复：正确解析字段映射
-            like_area = soup.select_one('.like_area')
-            if like_area:
-                # 查找所有包含数字的div
-                num_divs = like_area.find_all('div', class_='num')
-
-                for div in num_divs:
-                    div_text = div.get_text().strip()
-                    value_span = div.find('span', class_='l')
-
-                    if value_span:
-                        try:
-                            value = int(value_span.get_text().strip())
-
-                            # 根据div内容判断字段类型
-                            if 'Donation' in div_text:
-                                chart_data["donate_count"] = value
-                                self.logger.debug("提取打赏数: %s", value)
-                            elif 'Hot' in div_text:
-                                chart_data["heat"] = value
-                                self.logger.debug("提取热度: %s", value)
-                            elif 'N/A' not in div_text and not any(keyword in div_text for keyword in ['Donation', 'Hot']):
-                                # 可能是爱心数量
-                                chart_data["love_count"] = value
-                                chart_data["recommend_count"] = value
-                                self.logger.debug("提取爱心数: %s", value)
-                        except ValueError:
-                            self.logger.debug("无法解析数字: %s", value_span.get_text().strip())
-            else:
-                self.logger.debug("未找到热度区域")
-
-            # 如果还没有sid，记录警告
-            if not song_data["sid"]:
-                self.logger.warning("无法提取歌曲ID (cid=%s)", cid)
-
-            # 记录解析结果
-            self.logger.info("解析完成 - 标题: %s, 艺术家: %s, SID: %s, 模式: %s, 状态: %s",
-                        song_data["title"], song_data["artist"], song_data["sid"],
-                        chart_data["mode"], chart_data["status"])
-
-            return chart_data, song_data
-
-        except Exception as e:
-            self.logger.error("解析谱面页面失败 (cid=%s): %s", cid, e, exc_info=True)
+        root = soup.select_one(".song_title")
+        if not root or is_login_page(html):
             return None, None
+        sub = root.select_one(".sub")
+        text = sub.get_text(" ", strip=True) if sub else ""
+        actual = re.search(r"ID\s*:\s*c\s*(\d+)", text)
+        title = root.select_one(".title")
+        mode_node = root.select_one(".mode")
+        if not actual or int(actual[1]) != int(cid) or not title or not mode_node:
+            return None, None
+        back = root.select_one('a[href*="/song/"]')
+        sid_match = re.search(r"/song/(\d+)", back.get("href", "")) if back else None
+        cover = root.select_one(".cover")
+        cover_match = (
+            re.search(r"url\([\'\"]?(.*?)[\'\"]?\)", cover.get("style", ""))
+            if cover
+            else None
+        )
+        cover_url = cover_match[1].strip("\"'") if cover_match else None
+        if not sid_match and cover_url:
+            sid_match = re.search(r"/(\d+)(?:!|\.)", cover_url)
+        if not sid_match:
+            return None, None
+        artist = title.select_one(".artist")
+        artist_name = artist.get_text(" ", strip=True) if artist else None
+        clean = BeautifulSoup(str(title), "html.parser")
+        for node in clean.select(".artist,em"):
+            node.decompose()
+        name = clean.get_text(" ", strip=True)
+        if name.startswith("- "):
+            name = name[2:].strip()
+        status_node = title.select_one("em")
+        status = STATUS_MAP.get(status_node.get_text(strip=True)) if status_node else None
+        mode_icon = mode_node.select_one('img[src*="mode-"]')
+        mode_match = (
+            re.search(r"mode-(\d+)", mode_icon.get("src", "")) if mode_icon else None
+        )
+        version = mode_node.find("span", recursive=False)
+        if not name or status is None or not mode_match or not version:
+            return None, None
+        chart = {
+            "cid": int(cid),
+            "version": version.get_text(" ", strip=True),
+            "creator_uid": None,
+            "creator_name": None,
+            "stabled_by_uid": None,
+            "stabled_by_name": None,
+            "mode": int(mode_match[1]),
+            "status": status,
+            "level": None,
+            "chart_length": None,
+            "heat": None,
+            "love_count": None,
+            "recommend_count": None,
+            "not_recommend_count": None,
+            "comment_count": None,
+            "donate_count": None,
+            "play_count": None,
+            "last_updated": None,
+        }
+        level = re.search(r"\bLv\.?\s*(\d+(?:\.\d+)?)", chart["version"], re.I)
+        if level:
+            chart["level"] = level[1]
+        for label, uid_key, name_key in (
+            ("Created by:", "creator_uid", "creator_name"),
+            ("Stabled by:", "stabled_by_uid", "stabled_by_name"),
+        ):
+            label_node = next(
+                (
+                    node
+                    for node in mode_node.find_all("span")
+                    if node.get_text(strip=True).startswith(label)
+                ),
+                None,
+            )
+            link = label_node.find_next_sibling("a") if label_node else None
+            match = (
+                re.search(r"/accounts/user/(\d+)", link.get("href", "")) if link else None
+            )
+            if match:
+                chart[uid_key] = int(match[1])
+                chart[name_key] = link.get_text(strip=True)
+        date = re.search(r"Last updated\s*:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})", text)
+        if date:
+            chart["last_updated"] = datetime.strptime(date[1], "%Y-%m-%d %H:%M")
+        chart.update(parse_chart_metrics(html))
+        chart["tags_json"] = (
+            json.dumps(
+                [n.get_text(strip=True) for n in root.select(".tags a")], ensure_ascii=False
+            )
+            if root.select_one(".tags")
+            else None
+        )
+        song = {
+            "sid": int(sid_match[1]),
+            "title": name,
+            "title_org": name,
+            "artist": artist_name,
+            "bpm": None,
+            "length": None,
+            "cover_url": cover_url,
+        }
+        length = re.search(r"Length\s*:\s*(\d+)\s*s", text)
+        bpm = re.search(r"BPM\s*:\s*(\d+(?:\.\d+)?)", text)
+        if length:
+            song["length"] = int(length[1])
+        if bpm:
+            song["bpm"] = float(bpm[1])
+        # The chart page's edit time belongs to the chart, not the song.
+        for record in (chart, song):
+            record["_present"] = [k for k, v in record.items() if v is not None]
+            record["_source"] = "page_chart"
+            record["_observed_at"] = now()
+            record["_complete"] = True
+        chart["_source_time"] = (
+            chart["last_updated"].isoformat() if chart["last_updated"] else None
+        )
+        return chart, song
 
     def crawl_chart_detail(self, cid):
-        """爬取单个谱面的详细信息"""
-        url = CHART_URL.format(cid=cid)
-        self.logger.info("开始爬取谱面详情: cid=%s, url=%s", cid, url)
-
-        # 检查是否已处理过
+        cid = int(cid)
+        self.last_fetch_state = "retry"
         if cid in self.processed_charts:
-            self.logger.debug("谱面 %s 已处理过，跳过", cid)
-            return True
-
+            self.last_fetch_state = "skipped"
+            return False
         try:
-            response = self.session.get(url, timeout=30)
+            response = self._get_with_progress(
+                f"谱面详情 CID={cid}", CHART_URL.format(cid=cid), timeout=30
+            )
+            if self._is_confirmed_chart_deleted(response):
+                self.mark_chart_deleted(cid)
+                self.last_fetch_state = "not_found"
+                return None
             response.raise_for_status()
-
-            self.log_request_details(url, response)
-
-            # 检查页面内容
-            if len(response.content) < 100:
-                self.logger.warning("页面内容过短，可能为空页面: %s", len(response.content))
+            if is_login_page(response.text, getattr(response, "url", "")):
+                self.auth_required_detected = True
                 return False
-
-            chart_data, song_data = self.parse_chart_page(response.text, cid)
-            if chart_data and song_data:
-                self.logger.info("解析成功，准备保存数据: cid=%s", cid)
-                rec_count, cmt_count, talk_items = self._build_chart_social_data(cid)
-                chart_data["recommend_count"] = rec_count
-                chart_data["comment_count"] = cmt_count
-                success = self.save_chart_data(chart_data, song_data, talk_items=talk_items)
-                if success:
-                    self.processed_charts.add(cid)
-                    if song_data["sid"]:
-                        self.processed_songs.add(song_data["sid"])
-                return success
-            else:
-                self.logger.warning("解析谱面页面返回空数据 (cid=%s)", cid)
-                # 保存页面内容用于调试
-                debug_file = f"logs/debug_cid_{cid}.html"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(response.text)
-                self.logger.info("已保存页面内容到: %s", debug_file)
+            chart, song = self.parse_chart_page(response.text, cid)
+            if not chart:
                 return False
-
-        except requests.exceptions.RequestException as e:
-            self.logger.error("爬取谱面详情失败 (cid=%s): %s", cid, e)
-            if hasattr(e, 'response') and e.response is not None:
-                self.log_request_details(url, e.response)
-                if self._is_confirmed_chart_deleted(e.response):
-                    self.mark_chart_deleted(cid)
+            if (
+                getattr(self, "mode_filter", None) is not None
+                and chart["mode"] not in self.mode_filter
+            ) or (
+                getattr(self, "status_filter", None) is not None
+                and chart["status"] not in self.status_filter
+            ):
+                self.last_fetch_state = "filtered"
+                return False
+            # Use native chart length and current vote totals; HTML Length is a song value.
+            try:
+                info = self._new_api_get("/community/chart/info", {"cid": cid})
+                if (
+                    info.get("code") == 0
+                    and int(info.get("cid", 0)) == cid
+                    and int(info.get("sid", 0)) == song["sid"]
+                ):
+                    song_info = self._new_api_get(
+                        "/community/song/info", {"sid": song["sid"]}
+                    )
+                    ids = self.get_charts_from_song_page(song["sid"])
+                    if getattr(ids, "song_last_updated", None):
+                        song_info["_song_last_updated"] = ids.song_last_updated
+                    if self._save_chart_data_from_new_api(info, song_info):
+                        self.last_fetch_state = "done"
+                        return True
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                self.logger.warning("API supplement failed cid=%s: %s", cid, exc)
+            _, _, items = self._build_chart_social_data(cid)
+            success = self.save_chart_data(chart, song, talk_items=items)
+            if success:
+                self.last_fetch_state = "partial"
+            return False  # Native metadata still needs a retry.
+        except requests.RequestException as exc:
+            self.logger.warning("Chart fetch failed cid=%s: %s", cid, exc)
             return False
 
     def crawl_chart_detail_with_retry(self, cid, retry_count=0):
-        """爬取单个谱面详情，支持重试机制"""
-        if retry_count >= self.max_retries:
-            self.logger.warning("CID %d 已达到最大重试次数 %d，放弃爬取", cid, self.max_retries)
-            return False
-
-        url = CHART_URL.format(cid=cid)
-
-        try:
-            response = self.session.get(url, timeout=30)
-
-            # 检查响应状态
-            if response.status_code == 404:
-                if self._is_confirmed_chart_deleted(response):
-                    self.mark_chart_deleted(cid)
-                    return None  # 明确表示谱面不存在
-                else:
-                    self.crawl_stats["empty_404"] += 1
-                    self.logger.warning("CID %d 返回404，但未确认是谱面删除，不修改删除状态", cid)
-                    self.retry_queue.append((cid, retry_count + 1))
-                    return False
-
-            response.raise_for_status()
-
-            # 检查页面内容是否有效
-            if len(response.content) < 100:
-                self.logger.warning("CID %d 页面内容过短，可能无效", cid)
-                raise Exception("页面内容过短")
-
-            chart_data, song_data = self.parse_chart_page(response.text, cid)
-            if chart_data and song_data:
-                rec_count, cmt_count, talk_items = self._build_chart_social_data(cid)
-                chart_data["recommend_count"] = rec_count
-                chart_data["comment_count"] = cmt_count
-                success = self.save_chart_data(chart_data, song_data, talk_items=talk_items)
-                if success:
-                    self.processed_charts.add(cid)
-                    if song_data["sid"]:
-                        self.processed_songs.add(song_data["sid"])
-                    return True
-            else:
-                raise Exception("解析返回空数据")
-
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 404:
-                if self._is_confirmed_chart_deleted(e.response):
-                    self.mark_chart_deleted(cid)
-                    return None
-                else:
-                    self.crawl_stats["empty_404"] += 1
-                    self.logger.warning("CID %d 返回404，但未确认是谱面删除，不修改删除状态", cid)
-                    self.retry_queue.append((cid, retry_count + 1))
-                    return False
-            else:
-                self.logger.warning("CID %d HTTP错误 (重试 %d/%d): %s",
-                                  cid, retry_count + 1, self.max_retries, e)
-                self.crawl_stats["failed"] += 1
-                # 添加到重试队列
-                self.retry_queue.append((cid, retry_count + 1))
-                return False
-
-        except (requests.exceptions.RequestException, Exception) as e:
-            self.logger.warning("CID %d 爬取失败 (重试 %d/%d): %s",
-                              cid, retry_count + 1, self.max_retries, e)
-            self.crawl_stats["failed"] += 1
-            # 添加到重试队列
-            self.retry_queue.append((cid, retry_count + 1))
-            return False
-
-        return False
+        if int(cid) in self.processed_charts:
+            return True
+        result = self.crawl_chart_detail(cid)
+        if result is False and getattr(self, "last_fetch_state", None) != "filtered":
+            item = (int(cid), retry_count + 1)
+            if not any(int(v[0]) == int(cid) for v in self.retry_queue):
+                self.retry_queue.append(item)
+        return result
 
     def process_retry_queue(self, delay_between_retries=10):
-        """处理重试队列中的失败请求"""
-        if not self.retry_queue:
-            return 0
-
-        self.logger.info("开始处理重试队列，共有 %d 个失败请求", len(self.retry_queue))
-        success_count = 0
-
-        # 复制队列以避免在迭代时修改
-        retry_items = list(self.retry_queue)
-        self.retry_queue.clear()
-
-        for cid, retry_count in retry_items:
+        succeeded = 0
+        for _ in range(len(self.retry_queue)):
             if self._should_stop():
                 break
-
-            self.logger.info("重试 CID %d (第 %d 次重试)", cid, retry_count + 1)
-
-            # 重试间隔
+            cid, attempt = self.retry_queue.popleft()
+            if self._should_stop():
+                self.retry_queue.appendleft((cid, attempt))
+                break
             time.sleep(delay_between_retries)
-
-            result = self.crawl_chart_detail_with_retry(cid, retry_count)
-            if result is True:  # 明确成功
-                success_count += 1
-
-        self.logger.info("重试队列处理完成: 成功 %d/%d", success_count, len(retry_items))
-        return success_count
+            try:
+                result = self.crawl_chart_detail_with_retry(cid, attempt)
+                if result is True:
+                    succeeded += 1
+            except BaseException:
+                self.retry_queue.appendleft((cid, attempt))
+                raise
+        return succeeded
 
     def generate_data_hash(self, data):
         """生成数据的哈希值用于去重"""
@@ -1535,7 +1603,7 @@ class STBCrawler:
             """SELECT sid, version, creator_uid, creator_name, stabled_by_uid,
                       stabled_by_name, level, mode, chart_length, status, heat,
                       love_count, recommend_count, comment_count, donate_count,
-                      play_count, last_updated
+                      play_count, last_updated, not_recommend_count
                FROM charts WHERE cid = ?""",
             (cid,),
         )
@@ -1558,6 +1626,7 @@ class STBCrawler:
             ("打赏数", chart_data["donate_count"]),
             ("游玩数", chart_data["play_count"]),
             ("最后编辑", chart_data["last_updated"]),
+            ("不推荐数", chart_data.get("not_recommend_count")),
         )
         if old_chart is not None:
             for index, (label, new_value) in enumerate(chart_fields):
@@ -1627,113 +1696,115 @@ class STBCrawler:
         self.logger.info("=" * 60)
 
     def save_chart_data(self, chart_data, song_data, talk_items=None):
-        """保存谱面数据到数据库 - 覆盖更新模式，如果封面缺失则保留原来的封面"""
-        cursor = self.db_manager.get_connection().cursor()
-        crawl_time = datetime.now()
-
+        conn = self.db_manager.get_connection()
         try:
-            # 检查必要的数据是否存在
-            if not song_data["sid"]:
-                self.logger.error("缺少歌曲ID，无法保存数据 (cid=%s)", chart_data["cid"])
+            if (
+                not chart_data
+                or not song_data
+                or not song_data.get("sid")
+                or not chart_data.get("cid")
+            ):
                 return False
-
-            # 生成数据哈希
-            song_hash = self.generate_data_hash(song_data)
-            chart_hash = self.generate_data_hash(chart_data)
-
-            cursor.execute(
-                "SELECT data_hash, server_exists FROM charts WHERE cid = ?",
-                (chart_data["cid"],),
-            )
-            existing_chart = cursor.fetchone()
-            if existing_chart is None:
-                save_kind = "新增"
-            elif existing_chart[0] == chart_hash and existing_chart[1] == 1:
-                save_kind = "未变化"
-            else:
-                save_kind = "更新"
-
-            # 记录保存的数据详情
-            self.logger.info("保存数据详情 - 谱面: %s, 歌曲: %s, 标题: %s, 艺术家: %s, 模式: %s, 状态: %s",
-                           chart_data["cid"], song_data["sid"], song_data["title"],
-                           song_data["artist"], chart_data["mode"], chart_data["status"])
-
-            # 检查歌曲是否已存在，如果存在且新封面为空，则使用原来的封面
-            existing_cover_url = None
-            if not song_data["cover_url"]:
-                cursor.execute("SELECT cover_url FROM songs WHERE sid = ?", (song_data["sid"],))
-                result = cursor.fetchone()
-                if result and result[0]:
-                    existing_cover_url = result[0]
-                    self.logger.info("封面为空，使用数据库中已有的封面: %s", existing_cover_url)
-
-            # 保存歌曲信息 - 使用 REPLACE 覆盖更新
-            final_cover_url = song_data["cover_url"] if song_data["cover_url"] else existing_cover_url
-            changed_fields = self._get_chart_changes(
-                cursor,
-                chart_data["cid"],
-                song_data["sid"],
-                chart_data,
-                song_data,
-                final_cover_url,
-            )
-
-            cursor.execute('''
-            INSERT OR REPLACE INTO songs
-            (sid, title, artist, bpm, length, cover_url, last_updated, crawl_time, data_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                song_data["sid"], song_data["title"], song_data["artist"],
-                song_data["bpm"], song_data["length"], final_cover_url,
-                chart_data["last_updated"], crawl_time, song_hash
-            ))
-
-            # 保存谱面信息 - 使用 REPLACE 覆盖更新
-            cursor.execute('''
-            INSERT OR REPLACE INTO charts
-            (cid, sid, version, creator_uid, creator_name, stabled_by_uid, stabled_by_name,
-             level, mode, chart_length, status, heat, love_count, recommend_count, comment_count, donate_count, play_count,
-             last_updated, crawl_time, data_hash, server_exists, deleted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                chart_data["cid"], song_data["sid"], chart_data["version"],
-                chart_data["creator_uid"], chart_data["creator_name"],
-                chart_data["stabled_by_uid"], chart_data["stabled_by_name"],
-                chart_data["level"], chart_data["mode"], chart_data["chart_length"],
-                chart_data["status"], chart_data["heat"], chart_data["love_count"],
-                int(chart_data.get("recommend_count", 0) or 0),
-                int(chart_data.get("comment_count", 0) or 0),
-                chart_data["donate_count"], chart_data["play_count"],
-                chart_data["last_updated"], crawl_time, chart_hash, 1, None
-            ))
-
-            self._save_chart_comments(
-                cursor=cursor,
-                cid=chart_data["cid"],
-                comment_items=talk_items or [],
-                crawl_time=crawl_time,
-            )
-
-            self.db_manager.get_connection().commit()
-            stat_key = {"新增": "new", "更新": "updated", "未变化": "unchanged"}[save_kind]
-            self.crawl_stats[stat_key] += 1
-            color_code = {"新增": "32", "更新": "33", "未变化": "36"}[save_kind]
-            self.logger.info(
-                "[OK] %s谱面: %s - %s",
-                colorize(save_kind, color_code), chart_data["cid"], song_data["title"],
-            )
-            if save_kind == "更新":
-                if changed_fields:
-                    self.logger.info("  变更字段（不含最后爬取时间）: %s", "; ".join(changed_fields))
-                else:
-                    self.logger.info("  变更: 服务器存在状态恢复（业务字段未变化）")
-            elif save_kind == "未变化":
-                self.logger.info("  业务数据未变化（最后爬取时间不纳入判断）")
+            if chart_data.get("sid") is not None and int(chart_data["sid"]) != int(
+                song_data["sid"]
+            ):
+                return False
+            if (
+                not song_data.get("title")
+                or chart_data.get("mode") is None
+                or chart_data.get("status") is None
+            ):
+                return False
+            cid, sid = int(chart_data["cid"]), int(song_data["sid"])
+            with atomic(conn):
+                ensure_schema(conn)
+                old = conn.execute("SELECT 1 FROM charts WHERE cid=?", (cid,)).fetchone()
+                stamp = now()
+                song = dict(song_data)
+                song.update(
+                    crawl_time=stamp,
+                    data_hash=self.generate_data_hash(public_record(song_data)),
+                )
+                song.setdefault("last_updated", None)
+                chart = dict(chart_data)
+                chart.update(
+                    crawl_time=stamp,
+                    data_hash=self.generate_data_hash(public_record(chart_data)),
+                    server_exists=1,
+                    deleted_at=None,
+                )
+                for record in (song, chart):
+                    if "_present" in record:
+                        record["_present"] = list(record["_present"]) + [
+                            "crawl_time",
+                            "data_hash",
+                        ]
+                if "_present" in chart:
+                    chart["_present"] += ["server_exists", "deleted_at"]
+                chart["sid"] = sid
+                if "_present" in chart:
+                    chart["_present"].append("sid")
+                song_allowed = {r[1] for r in conn.execute("PRAGMA table_info(songs)")}
+                chart_allowed = {r[1] for r in conn.execute("PRAGMA table_info(charts)")}
+                _, song_changed = save_record(
+                    conn,
+                    "songs",
+                    "sid",
+                    sid,
+                    song,
+                    song_allowed,
+                    metadata_fields=(
+                        "title",
+                        "artist",
+                        "bpm",
+                        "length",
+                        "last_updated",
+                        "title_org",
+                        "artist_org",
+                    ),
+                )
+                merged, changed = save_record(
+                    conn,
+                    "charts",
+                    "cid",
+                    cid,
+                    chart,
+                    chart_allowed,
+                    metadata_fields=(
+                        "sid",
+                        "version",
+                        "creator_uid",
+                        "creator_name",
+                        "stabled_by_uid",
+                        "stabled_by_name",
+                        "level",
+                        "mode",
+                        "chart_length",
+                        "status",
+                        "last_updated",
+                        "checksum",
+                        "tags_json",
+                    ),
+                )
+                if talk_items is not None:
+                    self._save_chart_comments(conn.cursor(), cid, talk_items, stamp)
+                    if getattr(talk_items, "complete", False):
+                        count = conn.execute(
+                            "SELECT COUNT(*) FROM chart_comments WHERE cid=? AND is_current=1 AND is_recommend=0 AND is_not_recommend=0 AND (talk_type IS NULL OR talk_type!=1)",
+                            (cid,),
+                        ).fetchone()[0]
+                        conn.execute(
+                            "UPDATE charts SET comment_count=? WHERE cid=?", (count, cid)
+                        )
+                self.last_social_complete = bool(getattr(talk_items, "complete", False))
+            self.crawl_stats[
+                "new" if not old else "updated" if changed or song_changed else "unchanged"
+            ] += 1
             return True
-
-        except Exception as e:
-            self.logger.error("保存谱面数据失败 (cid=%s): %s", chart_data["cid"], e)
-            self.db_manager.get_connection().rollback()
+        except Exception as exc:
+            self.logger.error(
+                "Chart transaction rolled back cid=%s: %s", chart_data.get("cid"), exc
+            )
             self.crawl_stats["failed"] += 1
             return False
 
@@ -1778,7 +1849,9 @@ class STBCrawler:
 
         try:
             self.logger.debug("访问主页: %s", HOMEPAGE_URL)
-            response = self.session.get(HOMEPAGE_URL, timeout=30)
+            response = self._get_with_progress(
+                "读取主页谱面列表", HOMEPAGE_URL, timeout=30
+            )
             response.raise_for_status()
 
             self.log_request_details(HOMEPAGE_URL, response)
@@ -1789,7 +1862,9 @@ class STBCrawler:
             redirected_host = urlparse(response.url).netloc.lower() if response.url else ""
             if redirected_host and redirected_host != urlparse(HOMEPAGE_URL).netloc.lower():
                 self.home_source_unavailable = True
-                self.logger.warning("主页请求重定向到 %s，跳过主页数据源。", redirected_host)
+                self.logger.warning(
+                    "主页请求重定向到 %s，跳过主页数据源。", redirected_host
+                )
                 return -1
 
             if self._is_spa_shell_page(response.text):
@@ -1805,16 +1880,16 @@ class STBCrawler:
                 return -1
 
             # 查找新谱上架区域
-            new_map_section = soup.find('div', id='newMap')
+            new_map_section = soup.find("div", id="newMap")
             if not new_map_section:
                 self.logger.warning("未找到新谱上架区域 (id=newMap)")
                 # 保存页面用于调试
-                with open("logs/debug_homepage.html", 'w', encoding='utf-8') as f:
+                with open("logs/debug_homepage.html", "w", encoding="utf-8") as f:
                     f.write(response.text)
                 self.logger.info("已保存主页内容到 logs/debug_homepage.html")
                 # 兼容新页面：尝试从整页文本中回退提取CID
                 fallback_cids = []
-                for cid_text in re.findall(r'/chart/(\d+)', response.text):
+                for cid_text in re.findall(r"/chart/(\d+)", response.text):
                     cid = int(cid_text)
                     if cid not in self.processed_charts:
                         fallback_cids.append(cid)
@@ -1834,7 +1909,7 @@ class STBCrawler:
                 return 0
 
             # 查找所有谱面卡片
-            chart_cards = new_map_section.find_all('div', class_='g_map')
+            chart_cards = new_map_section.find_all("div", class_="g_map")
             self.logger.info("在主页找到 %d 个新谱面卡片", len(chart_cards))
 
             if not chart_cards:
@@ -1856,42 +1931,44 @@ class STBCrawler:
                     self.logger.info("达到最大爬取数量: %d", max_charts)
                     break
 
-                self.logger.debug("处理第 %d/%d 个谱面卡片", i+1, len(chart_cards))
+                self.logger.debug("处理第 %d/%d 个谱面卡片", i + 1, len(chart_cards))
 
                 # 提取歌曲链接
-                song_link = card.find('a', class_='link', href=True)
+                song_link = card.find("a", class_="link", href=True)
                 if not song_link:
-                    self.logger.debug("卡片 %d 未找到歌曲链接", i+1)
+                    self.logger.debug("卡片 %d 未找到歌曲链接", i + 1)
                     continue
 
-                song_url = song_link['href']
+                song_url = song_link["href"]
                 self.logger.debug("找到歌曲链接: %s", song_url)
 
-                if not song_url.startswith('/song/'):
-                    self.logger.debug("卡片 %d 的链接不是歌曲链接: %s", i+1, song_url)
+                if not song_url.startswith("/song/"):
+                    self.logger.debug("卡片 %d 的链接不是歌曲链接: %s", i + 1, song_url)
                     continue
 
                 # 提取歌曲ID
-                sid_match = re.search(r'/song/(\d+)', song_url)
+                sid_match = re.search(r"/song/(\d+)", song_url)
                 if not sid_match:
-                    self.logger.debug("卡片 %d 无法提取歌曲ID: %s", i+1, song_url)
+                    self.logger.debug("卡片 %d 无法提取歌曲ID: %s", i + 1, song_url)
                     continue
 
                 sid = int(sid_match.group(1))
                 self.logger.debug("提取到歌曲ID: %s", sid)
 
                 # 避免重复爬取同一歌曲
-                if sid in crawled_songs or sid in self.processed_songs:
+                if sid in crawled_songs:
                     self.logger.debug("歌曲 %d 已处理过，跳过", sid)
                     continue
                 crawled_songs.add(sid)
 
-                self.logger.info("处理歌曲 %d (%d/%d)", sid, i+1, len(chart_cards))
+                self.logger.info("处理歌曲 %d (%d/%d)", sid, i + 1, len(chart_cards))
 
                 # 从歌曲页面获取所有谱面
                 song_cids = self.get_charts_from_song_page(sid)
                 if song_cids:
-                    self.logger.info("歌曲 %d 有 %d 个谱面: %s", sid, len(song_cids), song_cids)
+                    self.logger.info(
+                        "歌曲 %d 有 %d 个谱面: %s", sid, len(song_cids), song_cids
+                    )
 
                     for j, cid in enumerate(song_cids):
                         if self._consume_skip("homepage source"):
@@ -1902,11 +1979,18 @@ class STBCrawler:
                         if success_count >= max_charts:
                             break
 
-                        self.logger.info("爬取谱面 %d/%d: cid=%s", j+1, len(song_cids), cid)
+                        self.logger.info(
+                            "爬取谱面 %d/%d: cid=%s", j + 1, len(song_cids), cid
+                        )
 
                         if self.crawl_chart_detail(cid):
                             success_count += 1
-                            self.logger.info("[OK] 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, max_charts)
+                            self.logger.info(
+                                "[OK] 成功爬取谱面 %s (进度: %d/%d)",
+                                cid,
+                                success_count,
+                                max_charts,
+                            )
                         else:
                             self.logger.warning("[FAIL] 爬取谱面 %s 失败", cid)
 
@@ -1922,54 +2006,48 @@ class STBCrawler:
             return 0
 
     def get_charts_from_song_page(self, sid):
-        """增强的歌曲页面CID获取"""
-        url = SONG_URL.format(sid=sid)
-        cids = set()
-
         try:
-            self.logger.debug("访问歌曲页面: %s", url)
-            response = self.session.get(url, timeout=30)
-
-            # 检查页面是否存在
+            response = self._get_with_progress(
+                f"歌曲 SID={sid} 的页面和谱面列表", SONG_URL.format(sid=sid), timeout=30
+            )
             if response.status_code == 404:
-                self.logger.debug("SID %d 不存在 (404)", sid)
-                return []
-
+                if self._is_confirmed_chart_deleted(response):
+                    return FetchList(complete=True, error="not_found")
+                return FetchList(error="unconfirmed_404")
             response.raise_for_status()
-
-            # 方法1: 正则匹配所有chart链接
-            pattern = r'/chart/(\d+)'
-            matches = re.findall(pattern, response.text)
-            for match in matches:
-                cids.add(int(match))
-
-            # 方法2: 从表格中提取
+            if is_login_page(response.text, getattr(response, "url", "")):
+                self.auth_required_detected = True
+                return FetchList(error="auth_required")
             soup = BeautifulSoup(response.text, "html.parser")
-
-            # 查找所有包含谱面链接的元素
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                if '/chart/' in href:
-                    cid_match = re.search(r'/chart/(\d+)', href)
-                    if cid_match:
-                        cids.add(int(cid_match.group(1)))
-
-            # 方法3: 从JavaScript数据中提取
-            script_text = soup.find('script', string=re.compile('cid'))
-            if script_text:
-                cid_matches = re.findall(r'cid[\'"]?\s*:\s*[\'"]?(\d+)', script_text.string)
-                for match in cid_matches:
-                    cids.add(int(match))
-
-            self.logger.info("从SID %d 提取到 %d 个CID", sid, len(cids))
-            return list(cids)
-
-        except requests.exceptions.RequestException as e:
-            self.logger.warning("访问SID %d 失败: %s", sid, e)
-            return []
-        except Exception as e:
-            self.logger.error("解析SID %d 页面时出错: %s", sid, e)
-            return []
+            root = soup.select_one(".song_title")
+            if not root:
+                return FetchList(error="invalid_song_page")
+            text = (
+                root.select_one(".sub").get_text(" ", strip=True)
+                if root.select_one(".sub")
+                else ""
+            )
+            match = re.search(r"ID\s*:\s*s\s*(\d+)", text)
+            if not match or int(match[1]) != int(sid):
+                return FetchList(error="song_id_mismatch")
+            chartlist = soup.select_one(".chartlist")
+            if not chartlist:
+                return FetchList(error="missing_chart_list")
+            cids = sorted(
+                {
+                    int(match[1])
+                    for link in chartlist.select("a[href]")
+                    if (match := re.search(r"^/chart/(\d+)(?:$|[?/#])", link["href"]))
+                }
+            )
+            result = FetchList(cids, complete=True)
+            date = re.search(r"Last updated\s*:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2})", text)
+            result.song_last_updated = (
+                datetime.strptime(date[1], "%Y-%m-%d %H:%M").isoformat() if date else None
+            )
+            return result
+        except (requests.RequestException, ValueError) as exc:
+            return FetchList(error=str(exc))
 
     def crawl_from_latest_page(self, max_charts=100):
         """从最近变动页面爬取谱面"""
@@ -1979,7 +2057,9 @@ class STBCrawler:
         latest_url = BASE_URL + "/page/latest"
         try:
             self.logger.debug("访问最近变动页面: %s", latest_url)
-            response = self.session.get(latest_url, timeout=30)
+            response = self._get_with_progress(
+                "读取最近变动谱面列表", latest_url, timeout=30
+            )
             response.raise_for_status()
 
             self.log_request_details(latest_url, response)
@@ -2053,8 +2133,11 @@ class STBCrawler:
             modes = [0]  # 默认Key模式
         if statuses is None:
             statuses = [2]  # 默认Stable状态
+        self.mode_filter, self.status_filter = modes, statuses
 
-        self.logger.info("搜索模式: %s, 状态: %s, 最大爬取数量: %d", modes, statuses, max_charts)
+        self.logger.info(
+            "搜索模式: %s, 状态: %s, 最大爬取数量: %d", modes, statuses, max_charts
+        )
 
         success_count = 0
 
@@ -2082,16 +2165,25 @@ class STBCrawler:
                         self.logger.warning("API数据源被403拒绝，停止该数据源。")
                         return -1
                     if not result or "list" not in result:
-                        self.logger.warning("模式 %d 状态 %d 第 %d 页无数据或请求失败", mode, status, page)
+                        self.logger.warning(
+                            "模式 %d 状态 %d 第 %d 页无数据或请求失败", mode, status, page
+                        )
                         break
 
                     chart_list = result["list"]
                     if not chart_list:
-                        self.logger.info("模式 %d 状态 %d 第 %d 页无数据，结束该模式", mode, status, page)
+                        self.logger.info(
+                            "模式 %d 状态 %d 第 %d 页无数据，结束该模式", mode, status, page
+                        )
                         break
 
-                    self.logger.info("模式 %d 状态 %d 第 %d 页获取到 %d 个谱面",
-                                   mode, status, page, len(chart_list))
+                    self.logger.info(
+                        "模式 %d 状态 %d 第 %d 页获取到 %d 个谱面",
+                        mode,
+                        status,
+                        page,
+                        len(chart_list),
+                    )
 
                     for i, chart in enumerate(chart_list):
                         if self._consume_skip("api search source"):
@@ -2106,12 +2198,19 @@ class STBCrawler:
                         if not cid:
                             continue
 
-                        self.logger.info("爬取谱面 %d/%d: cid=%s", i+1, len(chart_list), cid)
+                        self.logger.info(
+                            "爬取谱面 %d/%d: cid=%s", i + 1, len(chart_list), cid
+                        )
 
                         # 爬取谱面详情
                         if self.crawl_chart_detail(cid):
                             success_count += 1
-                            self.logger.info("[OK] 成功爬取谱面 %s (进度: %d/%d)", cid, success_count, max_charts)
+                            self.logger.info(
+                                "[OK] 成功爬取谱面 %s (进度: %d/%d)",
+                                cid,
+                                success_count,
+                                max_charts,
+                            )
                         else:
                             self.logger.warning("[FAIL] 爬取谱面 %s 失败", cid)
 
@@ -2122,8 +2221,13 @@ class STBCrawler:
                     has_more = page + 1 < result.get("total", 0)
                     page += 1
 
-                    self.logger.info("模式 %d 状态 %d 第 %d 页完成, 已爬取 %d 个谱面",
-                                   mode, status, page, success_count)
+                    self.logger.info(
+                        "模式 %d 状态 %d 第 %d 页完成, 已爬取 %d 个谱面",
+                        mode,
+                        status,
+                        page,
+                        success_count,
+                    )
 
             if self._should_stop() or success_count >= max_charts:
                 break
@@ -2131,17 +2235,23 @@ class STBCrawler:
         self.logger.info("方式3完成: 成功 %d/%d 个谱面", success_count, max_charts)
         return success_count
 
-    def crawl_all_sources_with_retry(self, max_charts_per_source=30, max_retries=3):
+    def crawl_all_sources_with_retry(
+        self, max_charts_per_source=30, max_retries=3, modes=None, statuses=None
+    ):
         """从所有数据源爬取谱面，带重试机制"""
-        self.logger.info("开始多数据源爬取，每个源最大 %d 个谱面，最大重试次数 %d",
-                        max_charts_per_source, max_retries)
+        self.mode_filter, self.status_filter = modes, statuses
+        self.logger.info(
+            "开始多数据源爬取，每个源最大 %d 个谱面，最大重试次数 %d",
+            max_charts_per_source,
+            max_retries,
+        )
 
         total_success = 0
         sources = [
             ("新官网API", self.crawl_from_new_api),
             ("主页爬取", self.crawl_from_homepage),
             ("最近变动", self.crawl_from_latest_page),
-            ("API搜索", self.crawl_from_api_search)
+            ("API搜索", self.crawl_from_api_search),
         ]
 
         for source_name, crawl_func in sources:
@@ -2171,20 +2281,31 @@ class STBCrawler:
                         success_count = crawl_func(max_charts=max_charts_per_source)
                     elif source_name == "最近变动":
                         success_count = crawl_func(max_charts=max_charts_per_source)
-                    else:  # API搜索
+                    elif source_name in ("新官网API", "API搜索"):
+                        success_count = crawl_func(
+                            max_charts=max_charts_per_source, modes=modes, statuses=statuses
+                        )
+                    else:
                         success_count = crawl_func(max_charts=max_charts_per_source)
 
                     if success_count < 0:
-                        self.logger.warning("数据源 %s 因认证限制被跳过，不再重试。", source_name)
+                        self.logger.warning(
+                            "数据源 %s 因认证限制被跳过，不再重试。", source_name
+                        )
                         break
 
                     if success_count > 0:
-                        self.logger.info("数据源 %s 成功爬取 %d 个谱面", source_name, success_count)
+                        self.logger.info(
+                            "数据源 %s 成功爬取 %d 个谱面", source_name, success_count
+                        )
                         total_success += success_count
                         break
                     else:
-                        self.logger.warning("数据源 %s 第 %d 次尝试未爬取到任何谱面",
-                                          source_name, retry_count + 1)
+                        self.logger.warning(
+                            "数据源 %s 第 %d 次尝试未爬取到任何谱面",
+                            source_name,
+                            retry_count + 1,
+                        )
                         retry_count += 1
 
                         if retry_count <= max_retries:
@@ -2192,8 +2313,9 @@ class STBCrawler:
                             time.sleep(retry_count * 5)
 
                 except Exception as e:
-                    self.logger.error("数据源 %s 第 %d 次尝试失败: %s",
-                                    source_name, retry_count + 1, e)
+                    self.logger.error(
+                        "数据源 %s 第 %d 次尝试失败: %s", source_name, retry_count + 1, e
+                    )
                     retry_count += 1
 
                     if retry_count <= max_retries:
@@ -2201,7 +2323,9 @@ class STBCrawler:
                         time.sleep(retry_count * 5)
 
             if retry_count > max_retries:
-                self.logger.warning("数据源 %s 重试 %d 次均失败，跳过", source_name, max_retries)
+                self.logger.warning(
+                    "数据源 %s 重试 %d 次均失败，跳过", source_name, max_retries
+                )
 
             # 源之间等待
             if not self._should_stop():
@@ -2211,11 +2335,18 @@ class STBCrawler:
         self.logger.info("所有数据源爬取完成: 总计 %d 个谱面", total_success)
         return total_success
 
-    def crawl_cid_with_persistence(self, start_cid=1, end_cid=None,
-                                 requests_per_minute=10, max_errors=50,
-                                 progress_file=os.path.join(DATA_DIR, "cid_progress.json"), resume=True,
-                                 retry_delay=30, process_retry_every=50,
-                                 skip_retry=False):
+    def crawl_cid_with_persistence(
+        self,
+        start_cid=1,
+        end_cid=None,
+        requests_per_minute=10,
+        max_errors=50,
+        progress_file=os.path.join(DATA_DIR, "cid_progress.json"),
+        resume=True,
+        retry_delay=30,
+        process_retry_every=50,
+        skip_retry=False,
+    ):
         """
         持久的CID爬取，支持失败重试和进度恢复
 
@@ -2230,24 +2361,34 @@ class STBCrawler:
             process_retry_every: 每N个请求处理一次重试队列
         """
         self.logger.info("=== 启动持久CID爬取 ===")
-        self.logger.info("模式: %s, 起始: %d, 结束: %s, 速度: %d请求/分钟",
-                        "恢复" if resume else "从头开始", start_cid,
-                        "无限制" if end_cid is None else end_cid, requests_per_minute)
+        self.logger.info(
+            "模式: %s, 起始: %d, 结束: %s, 速度: %d请求/分钟",
+            "恢复" if resume else "从头开始",
+            start_cid,
+            "无限制" if end_cid is None else end_cid,
+            requests_per_minute,
+        )
 
         # 加载或初始化进度
         if resume and os.path.exists(progress_file):
             progress = self._load_progress(progress_file)
-            current_cid = progress.get('current_cid', start_cid)
-            total_success = progress.get('total_success', 0)
-            total_errors = progress.get('total_errors', 0)
-            permanent_fails = set(progress.get('permanent_fails', []))
+            current_cid = progress.get("current_cid", start_cid)
+            total_success = progress.get("total_success", 0)
+            total_errors = progress.get("total_errors", 0)
+            permanent_fails = set(progress.get("permanent_fails", []))
 
             # 加载重试队列
-            retry_data = progress.get('retry_queue', [])
+            retry_data = progress.get("retry_queue", [])
             self.retry_queue = deque(retry_data)
 
-            self.logger.info("从进度文件恢复: CID=%d, 成功=%d, 错误=%d, 永久失败=%d, 重试队列=%d",
-                           current_cid, total_success, total_errors, len(permanent_fails), len(self.retry_queue))
+            self.logger.info(
+                "从进度文件恢复: CID=%d, 成功=%d, 错误=%d, 永久失败=%d, 重试队列=%d",
+                current_cid,
+                total_success,
+                total_errors,
+                len(permanent_fails),
+                len(self.retry_queue),
+            )
         else:
             current_cid = start_cid
             total_success = 0
@@ -2269,15 +2410,23 @@ class STBCrawler:
                     current_cid += 1
                     continue
                 # 定期处理重试队列
-                if not skip_retry and request_count % process_retry_every == 0 and self.retry_queue:
-                    self.logger.info("定期处理重试队列 (%d 个待重试)", len(self.retry_queue))
+                if (
+                    not skip_retry
+                    and request_count % process_retry_every == 0
+                    and self.retry_queue
+                ):
+                    self.logger.info(
+                        "定期处理重试队列 (%d 个待重试)", len(self.retry_queue)
+                    )
                     retry_success = self.process_retry_queue(retry_delay)
                     total_success += retry_success
 
                 # 跳过已处理或永久失败的CID
-                while (current_cid in self.processed_charts or
-                       current_cid in permanent_fails or
-                       any(cid == current_cid for cid, _ in self.retry_queue)):
+                while (
+                    current_cid in self.processed_charts
+                    or current_cid in permanent_fails
+                    or any(cid == current_cid for cid, _ in self.retry_queue)
+                ):
                     current_cid += 1
                     if end_cid is not None and current_cid > end_cid:
                         break
@@ -2285,9 +2434,12 @@ class STBCrawler:
                 if end_cid is not None and current_cid > end_cid:
                     break
 
-                self.logger.info("处理 CID %d (进度: %d/%s)",
-                               current_cid, total_success,
-                               "未知" if end_cid is None else str(end_cid - start_cid + 1))
+                self.logger.info(
+                    "处理 CID %d (进度: %d/%s)",
+                    current_cid,
+                    total_success,
+                    "未知" if end_cid is None else str(end_cid - start_cid + 1),
+                )
 
                 # 爬取当前CID
                 result = self.crawl_chart_detail_with_retry(current_cid)
@@ -2296,7 +2448,9 @@ class STBCrawler:
                 if result is True:  # 成功
                     total_success += 1
                     consecutive_errors = 0
-                    self.logger.info("[OK] CID %d 成功 (总计: %d)", current_cid, total_success)
+                    self.logger.info(
+                        "[OK] CID %d 成功 (总计: %d)", current_cid, total_success
+                    )
                 elif result is None:  # 明确不存在（404）
                     permanent_fails.add(current_cid)
                     consecutive_errors = 0
@@ -2310,25 +2464,42 @@ class STBCrawler:
 
                 # 错误过多时暂停
                 if consecutive_errors >= max_errors:
-                    self.logger.warning("连续错误达到 %d 次，暂停爬取并处理重试队列", max_errors)
-                    retry_success = self.process_retry_queue(retry_delay * 2)  # 更长的重试间隔
+                    self.logger.warning(
+                        "连续错误达到 %d 次，暂停爬取并处理重试队列", max_errors
+                    )
+                    retry_success = self.process_retry_queue(
+                        retry_delay * 2
+                    )  # 更长的重试间隔
                     total_success += retry_success
                     consecutive_errors = 0
 
                     if self.retry_queue:
-                        self.logger.info("重试队列仍有 %d 个项目，继续处理", len(self.retry_queue))
+                        self.logger.info(
+                            "重试队列仍有 %d 个项目，继续处理", len(self.retry_queue)
+                        )
                     else:
                         self.logger.info("重试队列已清空，恢复正常爬取")
 
                 # 保存进度（每10个请求或重试队列有变化时）
-                if (request_count % 10 == 0 or
-                    len(self.retry_queue) > 0 and request_count % 5 == 0):
+                if (
+                    request_count % 10 == 0
+                    or len(self.retry_queue) > 0
+                    and request_count % 5 == 0
+                ):
                     self._save_comprehensive_progress(
-                        progress_file, current_cid, total_success, total_errors,
-                        permanent_fails, self.retry_queue
+                        progress_file,
+                        current_cid,
+                        total_success,
+                        total_errors,
+                        permanent_fails,
+                        self.retry_queue,
                     )
-                    self.logger.debug("进度保存: CID=%d, 成功=%d, 错误=%d",
-                                    current_cid, total_success, total_errors)
+                    self.logger.debug(
+                        "进度保存: CID=%d, 成功=%d, 错误=%d",
+                        current_cid,
+                        total_success,
+                        total_errors,
+                    )
 
                 # 请求间隔（加入随机抖动）
                 actual_delay = request_interval * (0.8 + 0.4 * random.random())
@@ -2339,50 +2510,70 @@ class STBCrawler:
         finally:
             # 最终保存进度
             self._save_comprehensive_progress(
-                progress_file, current_cid, total_success, total_errors,
-                permanent_fails, self.retry_queue
+                progress_file,
+                current_cid,
+                total_success,
+                total_errors,
+                permanent_fails,
+                self.retry_queue,
             )
-            self.logger.info("最终进度保存: CID=%d, 成功=%d, 错误=%d, 重试队列=%d",
-                           current_cid, total_success, total_errors, len(self.retry_queue))
+            self.logger.info(
+                "最终进度保存: CID=%d, 成功=%d, 错误=%d, 重试队列=%d",
+                current_cid,
+                total_success,
+                total_errors,
+                len(self.retry_queue),
+            )
 
         # 最后处理剩余的重试队列
         if not skip_retry and self.retry_queue and not self._should_stop():
             self.logger.info("处理剩余的重试队列 (%d 个项目)", len(self.retry_queue))
             retry_success = self.process_retry_queue(retry_delay)
             total_success += retry_success
+            self._save_comprehensive_progress(
+                progress_file,
+                current_cid,
+                total_success,
+                total_errors,
+                permanent_fails,
+                self.retry_queue,
+            )
 
         self.logger.info("持久CID爬取完成: 成功 %d, 错误 %d", total_success, total_errors)
         return total_success
 
     def _load_progress(self, progress_file):
-        """加载爬取进度"""
-        try:
-            with open(progress_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            self.logger.warning("加载进度文件失败: %s，使用默认值", e)
-            return {}
+        from crawlers.ingestion import read_progress
 
-    def _save_comprehensive_progress(self, progress_file, current_cid, success_count,
-                                   error_count, permanent_fails, retry_queue):
+        return read_progress(progress_file)
+
+    def _save_comprehensive_progress(
+        self,
+        progress_file,
+        current_cid,
+        success_count,
+        error_count,
+        permanent_fails,
+        retry_queue,
+    ):
         """保存完整的爬取进度"""
         try:
             progress = {
-                'current_cid': current_cid,
-                'total_success': success_count,
-                'total_errors': error_count,
-                'permanent_fails': list(permanent_fails),
-                'retry_queue': list(retry_queue),
-                'last_save': datetime.now().isoformat(),
-                'processed_charts_count': len(self.processed_charts),
-                'processed_songs_count': len(self.processed_songs)
+                "current_cid": current_cid,
+                "total_success": success_count,
+                "total_errors": error_count,
+                "permanent_fails": list(permanent_fails),
+                "retry_queue": list(retry_queue),
+                "last_save": datetime.now().isoformat(),
+                "processed_charts_count": len(self.processed_charts),
+                "processed_songs_count": len(self.processed_songs),
             }
 
-            with open(progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress, f, ensure_ascii=False, indent=2)
+            atomic_json(progress_file, progress)
 
         except Exception as e:
             self.logger.error("保存进度文件失败: %s", e)
+            raise
 
     def get_progress_status(self, progress_file=os.path.join(DATA_DIR, "cid_progress.json")):
         """获取当前爬取状态"""
@@ -2411,205 +2602,116 @@ class STBCrawler:
         except Exception as e:
             return f"读取进度文件失败: {e}"
 
-    def crawl_by_sid_increment(self, start_sid=1, end_sid=None,
-                              requests_per_minute=10, max_errors=50,
-                              progress_file=os.path.join(DATA_DIR, "sid_progress.json"), resume=True,
-                              skip_empty_songs=True, max_cids_per_song=50):
-        """
-        按照SID递增爬取，然后获取每个SID下的所有CID
-
-        Args:
-            start_sid: 起始SID
-            end_sid: 结束SID
-            requests_per_minute: 每分钟请求数
-            max_errors: 连续错误最大次数
-            progress_file: 进度文件路径
-            resume: 是否从进度恢复
-            skip_empty_songs: 是否跳过没有谱面的歌曲
-            max_cids_per_song: 每首歌曲最大CID数量限制
-        """
-        self.logger.info("=== 启动SID优先爬取策略 ===")
-        self.logger.info("模式: %s, 起始SID: %d, 结束SID: %s, 速度: %d请求/分钟",
-                        "恢复" if resume else "从头开始", start_sid,
-                        "无限制" if end_sid is None else end_sid, requests_per_minute)
-
-        # 加载或初始化进度
-        if resume and os.path.exists(progress_file):
-            progress = self._load_sid_progress(progress_file)
-            current_sid = progress.get('current_sid', start_sid)
-            total_songs = progress.get('total_songs', 0)
-            total_charts = progress.get('total_charts', 0)
-            total_errors = progress.get('total_errors', 0)
-            empty_songs = set(progress.get('empty_songs', []))
-            failed_songs = set(progress.get('failed_songs', []))
-
-            self.logger.info("从进度文件恢复: SID=%d, 歌曲=%d, 谱面=%d, 错误=%d, 空歌曲=%d, 失败歌曲=%d",
-                           current_sid, total_songs, total_charts, total_errors, len(empty_songs), len(failed_songs))
-        else:
-            current_sid = start_sid
-            total_songs = 0
-            total_charts = 0
-            total_errors = 0
-            empty_songs = set()
-            failed_songs = set()
-            self.logger.info("从头开始爬取")
-
-        # 计算请求间隔
-        request_interval = 60.0 / requests_per_minute
-        self.logger.info("请求间隔: %.1f秒", request_interval)
-
+    def crawl_by_sid_increment(
+        self,
+        start_sid=1,
+        end_sid=None,
+        requests_per_minute=10,
+        max_errors=50,
+        progress_file=os.path.join(DATA_DIR, "sid_progress.json"),
+        resume=True,
+        skip_empty_songs=True,
+        max_cids_per_song=50,
+    ):
+        state = (
+            self._load_sid_progress(progress_file)
+            if resume and os.path.exists(progress_file)
+            else {}
+        )
+        current = int(state.get("current_sid", start_sid))
+        failed = set(state.get("failed_songs", []))
+        empty = set(state.get("empty_songs", []))
+        total_songs = int(state.get("total_songs", 0))
+        total_charts = int(state.get("total_charts", 0))
+        errors = int(state.get("total_errors", 0))
         consecutive_errors = 0
-        request_count = 0
-
+        # Legacy empty/failed sets are observations, not permanent skip lists.
         try:
-            while not self._should_stop() and (end_sid is None or current_sid <= end_sid):
-                if self._consume_skip(f"sid {current_sid}"):
-                    current_sid += 1
-                    continue
-                # 跳过已处理或已知为空的SID
-                while (current_sid in empty_songs or
-                       current_sid in failed_songs or
-                       current_sid in self.processed_songs):
-                    current_sid += 1
-                    if end_sid is not None and current_sid > end_sid:
-                        break
-
-                if end_sid is not None and current_sid > end_sid:
-                    break
-
-                self.logger.info("处理 SID %d (进度: 歌曲=%d, 谱面=%d)",
-                               current_sid, total_songs, total_charts)
-
-                # 获取该SID下的所有CID
-                cids = self.get_charts_from_song_page(current_sid)
-                request_count += 1
-
-                if cids:
-                    self.logger.info("SID %d 有 %d 个谱面: %s", current_sid, len(cids), cids[:10])  # 只显示前10个
-
-                    # 限制每首歌曲的CID数量
-                    if len(cids) > max_cids_per_song:
-                        self.logger.warning("SID %d 有 %d 个谱面，超过限制 %d，只处理前 %d 个",
-                                          current_sid, len(cids), max_cids_per_song, max_cids_per_song)
-                        cids = cids[:max_cids_per_song]
-
-                    # 爬取该SID下的所有CID
-                    song_success_count = 0
-                    for cid in cids:
-                        if self._should_stop():
-                            break
-
-                        # 跳过已处理的CID
-                        if cid in self.processed_charts:
-                            continue
-
-                        self.logger.info("爬取 CID %d (SID %d 的第 %d/%d 个谱面)",
-                                       cid, current_sid, song_success_count + 1, len(cids))
-
-                        result = self.crawl_chart_detail_with_retry(cid)
-                        request_count += 1
-
-                        if result is True:  # 成功
-                            song_success_count += 1
-                            total_charts += 1
-                            consecutive_errors = 0
-                            self.logger.info("[OK] CID %d 成功 (SID %d: %d/%d)",
-                                           cid, current_sid, song_success_count, len(cids))
-                        elif result is None:  # 明确不存在
-                            self.logger.debug("CID %d 不存在", cid)
-                        else:  # 失败
-                            total_errors += 1
-                            consecutive_errors += 1
-                            self.logger.warning("CID %d 爬取失败", cid)
-
-                        # CID之间的延迟
-                        time.sleep(request_interval)
-
-                    if song_success_count > 0:
-                        total_songs += 1
-                        self.logger.info("[OK] SID %d 完成: %d/%d 个谱面成功",
-                                       current_sid, song_success_count, len(cids))
-                    else:
-                        self.logger.warning("SID %d 没有成功爬取任何谱面", current_sid)
-                        failed_songs.add(current_sid)
-
-                else:
-                    # 没有找到CID
-                    if skip_empty_songs:
-                        empty_songs.add(current_sid)
-                        self.logger.debug("SID %d 没有谱面，标记为空", current_sid)
-                    else:
-                        self.logger.info("SID %d 没有找到谱面", current_sid)
-
-                current_sid += 1
-                consecutive_errors = 0  # 重置错误计数，因为每个SID都是独立的
-
-                # 错误过多时暂停
-                if consecutive_errors >= max_errors:
-                    self.logger.warning("连续错误达到 %d 次，暂停爬取", max_errors)
-                    self.logger.info("等待60秒后继续...")
-                    time.sleep(60)
+            while not self._should_stop() and (end_sid is None or current <= end_sid):
+                cids = self.get_charts_from_song_page(current)
+                if not getattr(cids, "complete", False):
+                    failed.add(current)
+                    errors += 1
+                    consecutive_errors += 1
+                elif not cids:
                     consecutive_errors = 0
-
-                # 保存进度（每10个SID或每50个请求）
-                if (request_count % 50 == 0 or
-                    (current_sid - start_sid) % 10 == 0):
-                    self._save_sid_progress(
-                        progress_file, current_sid, total_songs, total_charts,
-                        total_errors, empty_songs, failed_songs
-                    )
-                    self.logger.info("进度保存: SID=%d, 歌曲=%d, 谱面=%d, 错误=%d",
-                                   current_sid, total_songs, total_charts, total_errors)
-
-                # SID之间的延迟（比CID之间更长）
-                actual_delay = request_interval * (1.0 + 0.5 * random.random())
-                time.sleep(actual_delay)
-
-        except KeyboardInterrupt:
-            self.logger.info("用户主动中断爬取")
+                    if skip_empty_songs:
+                        empty.add(current)
+                    failed.discard(current)
+                else:
+                    consecutive_errors = 0
+                    remaining = [cid for cid in cids if cid not in self.processed_charts]
+                    all_done = True
+                    for cid in remaining[:max_cids_per_song]:
+                        if self._should_stop():
+                            all_done = False
+                            break
+                        result = self.crawl_chart_detail_with_retry(cid)
+                        if result is True:
+                            total_charts += 1
+                        elif (
+                            result is False
+                            and getattr(self, "last_fetch_state", None) != "filtered"
+                        ):
+                            all_done = False
+                            errors += 1
+                        time.sleep(60 / max(1, requests_per_minute))
+                    if len(remaining) > max_cids_per_song:
+                        all_done = False
+                    if all_done:
+                        total_songs += 1
+                        failed.discard(current)
+                        empty.discard(current)
+                        self.processed_songs.add(current)
+                    else:
+                        failed.add(current)
+                if consecutive_errors >= max_errors:
+                    break
+                current += 1
+                self._save_sid_progress(
+                    progress_file, current, total_songs, total_charts, errors, empty, failed
+                )
+                time.sleep(60 / max(1, requests_per_minute))
         finally:
-            # 最终保存进度
             self._save_sid_progress(
-                progress_file, current_sid, total_songs, total_charts,
-                total_errors, empty_songs, failed_songs
+                progress_file, current, total_songs, total_charts, errors, empty, failed
             )
-            self.logger.info("最终进度保存: SID=%d, 歌曲=%d, 谱面=%d, 错误=%d",
-                           current_sid, total_songs, total_charts, total_errors)
-
-        self.logger.info("SID优先爬取完成: 歌曲 %d, 谱面 %d, 错误 %d",
-                       total_songs, total_charts, total_errors)
         return total_songs, total_charts
 
     def _load_sid_progress(self, progress_file):
-        """加载SID爬取进度"""
-        try:
-            with open(progress_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            self.logger.warning("加载SID进度文件失败: %s，使用默认值", e)
-            return {}
+        from crawlers.ingestion import read_progress
 
-    def _save_sid_progress(self, progress_file, current_sid, total_songs,
-                          total_charts, total_errors, empty_songs, failed_songs):
+        return read_progress(progress_file)
+
+    def _save_sid_progress(
+        self,
+        progress_file,
+        current_sid,
+        total_songs,
+        total_charts,
+        total_errors,
+        empty_songs,
+        failed_songs,
+    ):
         """保存SID爬取进度"""
         try:
             progress = {
-                'current_sid': current_sid,
-                'total_songs': total_songs,
-                'total_charts': total_charts,
-                'total_errors': total_errors,
-                'empty_songs': list(empty_songs),
-                'failed_songs': list(failed_songs),
-                'last_save': datetime.now().isoformat(),
-                'processed_charts_count': len(self.processed_charts),
-                'processed_songs_count': len(self.processed_songs)
+                "current_sid": current_sid,
+                "total_songs": total_songs,
+                "total_charts": total_charts,
+                "total_errors": total_errors,
+                "empty_songs": list(empty_songs),
+                "failed_songs": list(failed_songs),
+                "last_save": datetime.now().isoformat(),
+                "processed_charts_count": len(self.processed_charts),
+                "processed_songs_count": len(self.processed_songs),
             }
 
-            with open(progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress, f, ensure_ascii=False, indent=2)
+            atomic_json(progress_file, progress)
 
         except Exception as e:
             self.logger.error("保存SID进度文件失败: %s", e)
+            raise
 
     def get_sid_progress_status(self, progress_file=os.path.join(DATA_DIR, "sid_progress.json")):
         """获取SID爬取状态"""
@@ -2640,193 +2742,105 @@ class STBCrawler:
         except Exception as e:
             return f"读取SID进度文件失败: {e}"
 
-    def crawl_sid_backwards(self, start_sid=None, max_requests_per_minute=10,
-                           progress_file=os.path.join(DATA_DIR, "sid_backwards_progress.json"), resume=True):
-        """
-        向后爬取SID，直到遇到404自动停止
-
-        Args:
-            start_sid: 起始SID（如果为None则从进度文件恢复或从1开始）
-            max_requests_per_minute: 每分钟最大请求数
-            progress_file: 进度文件路径
-            resume: 是否从进度恢复
-        """
-        self.logger.info("=== 启动向后SID爬取模式 ===")
-
-        # 加载或初始化进度
-        if resume and os.path.exists(progress_file):
-            progress = self._load_sid_backwards_progress(progress_file)
-            current_sid = progress.get('current_sid')
-            last_valid_sid = progress.get('last_valid_sid')
-            total_songs = progress.get('total_songs', 0)
-            total_charts = progress.get('total_charts', 0)
-            total_errors = progress.get('total_errors', 0)
-            consecutive_404s = progress.get('consecutive_404s', 0)
-
-            self.logger.info("从进度文件恢复: 当前SID=%s, 最后有效SID=%s, 歌曲=%d, 谱面=%d, 错误=%d, 连续404=%d",
-                           current_sid, last_valid_sid, total_songs, total_charts, total_errors, consecutive_404s)
-
-            # 如果没有当前SID，使用最后有效SID或起始SID
-            if current_sid is None:
-                current_sid = last_valid_sid if last_valid_sid else start_sid
-        else:
-            current_sid = start_sid if start_sid else 1
-            last_valid_sid = None
-            total_songs = 0
-            total_charts = 0
-            total_errors = 0
-            consecutive_404s = 0
-            self.logger.info("从头开始爬取，起始SID: %s", current_sid)
-
-        if current_sid is None:
-            self.logger.error("无法确定起始SID，请指定start_sid参数")
-            return total_songs, total_charts
-
-        # 计算请求间隔
-        request_interval = 60.0 / max_requests_per_minute
-        self.logger.info("请求间隔: %.1f秒", request_interval)
-
-        max_consecutive_404s = 10  # 连续遇到10个404就认为到达末尾
-
+    def crawl_sid_backwards(
+        self,
+        start_sid=None,
+        max_requests_per_minute=10,
+        progress_file=os.path.join(DATA_DIR, "sid_backwards_progress.json"),
+        resume=True,
+    ):
+        # This legacy upward discovery mode stops on ten confirmed 404s; this is
+        # a search heuristic, never a claim that every higher ID is absent.
+        progress = self._load_sid_backwards_progress(progress_file) if resume else {}
+        current_sid = progress.get("current_sid", start_sid or 1)
+        last_valid_sid = progress.get("last_valid_sid")
+        total_songs = progress.get("total_songs", 0)
+        total_charts = progress.get("total_charts", 0)
+        total_errors = progress.get("total_errors", 0)
+        missing = 0
+        self.set_api_rate_limit(max_requests_per_minute)
         try:
-            while not self._should_stop() and consecutive_404s < max_consecutive_404s:
-                if self._consume_skip(f"sid {current_sid}"):
-                    current_sid += 1
-                    continue
-                self.logger.info("处理 SID %d (连续404: %d/%d)",
-                               current_sid, consecutive_404s, max_consecutive_404s)
-
-                # 检查是否已处理过（避免重复）
-                if current_sid in self.processed_songs:
-                    self.logger.debug("SID %d 已处理过，跳过", current_sid)
-                    current_sid += 1
-                    continue
-
-                # 获取该SID下的所有CID
-                cids = self.get_charts_from_song_page(current_sid)
-
-                if cids:
-                    # 成功获取到CID，重置404计数
-                    consecutive_404s = 0
-                    last_valid_sid = current_sid
-
-                    self.logger.info("SID %d 有 %d 个谱面", current_sid, len(cids))
-
-                    # 爬取该SID下的所有CID
-                    song_success_count = 0
-                    for cid in cids:
-                        if self._should_stop():
-                            break
-
-                        # 跳过已处理的CID
-                        if cid in self.processed_charts:
-                            continue
-
-                        self.logger.info("爬取 CID %d (SID %d 的第 %d/%d 个谱面)",
-                                       cid, current_sid, song_success_count + 1, len(cids))
-
-                        result = self.crawl_chart_detail_with_retry(cid)
-
-                        if result is True:  # 成功
-                            song_success_count += 1
-                            total_charts += 1
-                            self.logger.info("[OK] CID %d 成功 (SID %d: %d/%d)",
-                                           cid, current_sid, song_success_count, len(cids))
-                        elif result is None:  # 明确不存在
-                            self.logger.debug("CID %d 不存在", cid)
-                        else:  # 失败
-                            total_errors += 1
-                            self.logger.warning("CID %d 爬取失败", cid)
-
-                        # CID之间的延迟
-                        time.sleep(request_interval)
-
-                    if song_success_count > 0:
-                        total_songs += 1
-                        self.logger.info("[OK] SID %d 完成: %d/%d 个谱面成功",
-                                       current_sid, song_success_count, len(cids))
-                    else:
-                        self.logger.info("SID %d 没有新谱面需要爬取", current_sid)
-
+            while not self._should_stop() and missing < 10:
+                ids = self.get_charts_from_song_page(current_sid)
+                if not getattr(ids, "complete", False):
+                    total_errors += 1
+                    break  # Keep this SID as the restart point; errors are not 404s.
+                if getattr(ids, "error", None) == "not_found":
+                    missing += 1
                 else:
-                    # 没有找到CID，增加404计数
-                    consecutive_404s += 1
-                    self.logger.info("SID %d 返回空数据 (连续404: %d/%d)",
-                                   current_sid, consecutive_404s, max_consecutive_404s)
-
-                    # 如果是第一个404，记录为可能的最后一个有效SID
-                    if consecutive_404s == 1 and last_valid_sid is None and current_sid > 1:
-                        last_valid_sid = current_sid - 1
-                        self.logger.info("第一个404，记录最后有效SID为: %d", last_valid_sid)
-
-                # 移动到下一个SID
+                    missing = 0
+                    last_valid_sid = current_sid
+                    finished = True
+                    for cid in ids:
+                        if self._should_stop():
+                            finished = False
+                            break
+                        result = self.crawl_chart_detail_with_retry(cid)
+                        if result is False:
+                            finished = False
+                            total_errors += 1
+                        elif result is True:
+                            total_charts += 1
+                    if not finished:
+                        break
+                    total_songs += 1
+                    self.processed_songs.add(current_sid)
                 current_sid += 1
-
-                # 定期保存进度（每10个SID或每遇到404时）
-                if (current_sid % 10 == 0 or consecutive_404s > 0 or
-                    self._should_stop() or consecutive_404s >= max_consecutive_404s):
-                    self._save_sid_backwards_progress(
-                        progress_file, current_sid, last_valid_sid, total_songs,
-                        total_charts, total_errors, consecutive_404s
-                    )
-                    self.logger.debug("进度保存: SID=%d, 最后有效=%s, 歌曲=%d, 谱面=%d, 错误=%d, 连续404=%d",
-                                    current_sid, last_valid_sid, total_songs, total_charts, total_errors, consecutive_404s)
-
-                # SID之间的延迟
-                actual_delay = request_interval * (1.0 + 0.5 * random.random())
-                time.sleep(actual_delay)
-
-        except KeyboardInterrupt:
-            self.logger.info("用户主动中断爬取")
-        except Exception as e:
-            self.logger.error("向后SID爬取出错: %s", e, exc_info=True)
+                self._save_sid_backwards_progress(
+                    progress_file,
+                    current_sid,
+                    last_valid_sid,
+                    total_songs,
+                    total_charts,
+                    total_errors,
+                    missing,
+                )
         finally:
-            # 最终保存进度
             self._save_sid_backwards_progress(
-                progress_file, current_sid, last_valid_sid, total_songs,
-                total_charts, total_errors, consecutive_404s
+                progress_file,
+                current_sid,
+                last_valid_sid,
+                total_songs,
+                total_charts,
+                total_errors,
+                missing,
             )
-
-            if consecutive_404s >= max_consecutive_404s:
-                self.logger.info("已达到连续 %d 个404，自动停止爬取", max_consecutive_404s)
-                if last_valid_sid:
-                    self.logger.info("检测到的最后一个有效SID: %d", last_valid_sid)
-
-            self.logger.info("向后SID爬取完成: 歌曲 %d, 谱面 %d, 错误 %d",
-                           total_songs, total_charts, total_errors)
-
         return total_songs, total_charts
 
-    def _save_sid_backwards_progress(self, progress_file, current_sid, last_valid_sid,
-                                   total_songs, total_charts, total_errors, consecutive_404s):
+    def _save_sid_backwards_progress(
+        self,
+        progress_file,
+        current_sid,
+        last_valid_sid,
+        total_songs,
+        total_charts,
+        total_errors,
+        consecutive_404s,
+    ):
         """保存向后SID爬取进度"""
         try:
             progress = {
-                'current_sid': current_sid,
-                'last_valid_sid': last_valid_sid,
-                'total_songs': total_songs,
-                'total_charts': total_charts,
-                'total_errors': total_errors,
-                'consecutive_404s': consecutive_404s,
-                'last_save': datetime.now().isoformat(),
-                'processed_charts_count': len(self.processed_charts),
-                'processed_songs_count': len(self.processed_songs)
+                "current_sid": current_sid,
+                "last_valid_sid": last_valid_sid,
+                "total_songs": total_songs,
+                "total_charts": total_charts,
+                "total_errors": total_errors,
+                "consecutive_404s": consecutive_404s,
+                "last_save": datetime.now().isoformat(),
+                "processed_charts_count": len(self.processed_charts),
+                "processed_songs_count": len(self.processed_songs),
             }
 
-            with open(progress_file, 'w', encoding='utf-8') as f:
-                json.dump(progress, f, ensure_ascii=False, indent=2)
+            atomic_json(progress_file, progress)
 
         except Exception as e:
             self.logger.error("保存向后SID进度文件失败: %s", e)
+            raise
 
     def _load_sid_backwards_progress(self, progress_file):
-        """加载向后SID爬取进度"""
-        try:
-            with open(progress_file, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            self.logger.warning("加载向后SID进度文件失败: %s，使用默认值", e)
-            return {}
+        from crawlers.ingestion import read_progress
+
+        return read_progress(progress_file)
 
     def get_sid_backwards_progress_status(self, progress_file=os.path.join(DATA_DIR, "sid_backwards_progress.json")):
         """获取向后SID爬取状态"""
@@ -2857,8 +2871,13 @@ class STBCrawler:
         except Exception as e:
             return f"读取向后SID进度文件失败: {e}"
 
-    def retry_failed_items(self, progress_files=None, requests_per_minute=5,
-                          max_retries=3, remove_successful=True):
+    def retry_failed_items(
+        self,
+        progress_files=None,
+        requests_per_minute=5,
+        max_retries=3,
+        remove_successful=True,
+    ):
         """
         重新爬取所有失败的项目（从进度文件中）
 
@@ -2872,7 +2891,7 @@ class STBCrawler:
             progress_files = [
                 os.path.join(DATA_DIR, "cid_progress.json"),
                 os.path.join(DATA_DIR, "sid_progress.json"),
-                os.path.join(DATA_DIR, "sid_backwards_progress.json")
+                os.path.join(DATA_DIR, "sid_backwards_progress.json"),
             ]
 
         self.logger.info("=== 开始重新爬取失败项目 ===")
@@ -2888,28 +2907,28 @@ class STBCrawler:
                 continue
 
             try:
-                with open(progress_file, 'r', encoding='utf-8') as f:
+                with open(progress_file, "r", encoding="utf-8") as f:
                     progress = json.load(f)
                     progress_data[progress_file] = progress
 
                     # 从CID进度文件收集失败项目
-                    if 'permanent_fails' in progress:
-                        for cid in progress['permanent_fails']:
-                            all_failed_items.add(('cid', cid))
+                    if "permanent_fails" in progress:
+                        for cid in progress["permanent_fails"]:
+                            all_failed_items.add(("cid", cid))
 
-                    if 'retry_queue' in progress:
-                        for item in progress['retry_queue']:
+                    if "retry_queue" in progress:
+                        for item in progress["retry_queue"]:
                             if isinstance(item, list) and len(item) > 0:
-                                all_failed_items.add(('cid', item[0]))
+                                all_failed_items.add(("cid", item[0]))
 
                     # 从SID进度文件收集失败项目
-                    if 'empty_songs' in progress:
-                        for sid in progress['empty_songs']:
-                            all_failed_items.add(('sid', sid))
+                    if "empty_songs" in progress:
+                        for sid in progress["empty_songs"]:
+                            all_failed_items.add(("sid", sid))
 
-                    if 'failed_songs' in progress:
-                        for sid in progress['failed_songs']:
-                            all_failed_items.add(('sid', sid))
+                    if "failed_songs" in progress:
+                        for sid in progress["failed_songs"]:
+                            all_failed_items.add(("sid", sid))
 
             except Exception as e:
                 self.logger.error("读取进度文件 %s 失败: %s", progress_file, e)
@@ -2932,19 +2951,22 @@ class STBCrawler:
             if self._should_stop():
                 break
 
-            self.logger.info("重新爬取 %s %d (%d/%d)",
-                           item_type.upper(), item_id, i+1, total_count)
+            self.logger.info(
+                "重新爬取 %s %d (%d/%d)", item_type.upper(), item_id, i + 1, total_count
+            )
 
             result = False
-            if item_type == 'cid':
-                result = self.crawl_chart_detail_with_retry(item_id)
-            elif item_type == 'sid':
+            if item_type == "cid":
+                result = self.crawl_chart_detail_with_retry(item_id) is not False
+            elif item_type == "sid":
                 cids = self.get_charts_from_song_page(item_id)
-                if cids:
-                    for cid in cids:
-                        if self.crawl_chart_detail_with_retry(cid):
-                            result = True
-                            break
+                result = bool(getattr(cids, "complete", False))
+                for cid in cids:
+                    if self._should_stop():
+                        result = False
+                        break
+                    if self.crawl_chart_detail_with_retry(cid) is False:
+                        result = False
 
             if result:
                 success_count += 1
@@ -2954,7 +2976,9 @@ class STBCrawler:
                 if remove_successful:
                     self._remove_from_failed_lists(progress_data, item_type, item_id)
             else:
-                self.logger.warning("[FAIL] 重新爬取 %s %d 失败", item_type.upper(), item_id)
+                self.logger.warning(
+                    "[FAIL] 重新爬取 %s %d 失败", item_type.upper(), item_id
+                )
 
             # 请求间隔
             time.sleep(request_interval)
@@ -2963,8 +2987,7 @@ class STBCrawler:
         if remove_successful:
             for progress_file, progress in progress_data.items():
                 try:
-                    with open(progress_file, 'w', encoding='utf-8') as f:
-                        json.dump(progress, f, ensure_ascii=False, indent=2)
+                    atomic_json(progress_file, progress)
                     self.logger.info("已更新进度文件: %s", progress_file)
                 except Exception as e:
                     self.logger.error("保存进度文件 %s 失败: %s", progress_file, e)
@@ -3022,60 +3045,119 @@ class STBCrawler:
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='STB谱面爬虫')
-    parser.add_argument('--days', type=int, default=7, help='爬取最近多少天的数据（默认7天）')
-    parser.add_argument('--modes', type=str, help='指定模式，逗号分隔（如0,1,2）')
-    parser.add_argument('--statuses', type=str, help='指定状态，逗号分隔（0=Alpha,1=Beta,2=Stable）')
-    parser.add_argument('--cid', type=str, help='爬取指定谱面ID，逗号分隔')
-    parser.add_argument('--sid', type=str, help='爬取指定歌曲ID的所有谱面，逗号分隔')
-    parser.add_argument('--once', action='store_true', help='运行一次后退出')
-    parser.add_argument('--test', action='store_true', help='只测试连接')
-    parser.add_argument('--test-api', action='store_true', help='测试API访问')
-    parser.add_argument('--no-api', action='store_true', help='不使用API搜索，使用其他数据源')
-    parser.add_argument('--source', choices=['all', 'home', 'latest', 'api', 'newapi'], default='all',
-                       help='选择数据源: all=全部, home=主页, latest=最近变动, api=API搜索')
-    parser.add_argument('--max-charts', type=int, default=60, help='每个数据源最大爬取数量（默认60）')
-    parser.add_argument('--max-retries', type=int, default=3, help='每个数据源最大重试次数（默认3）')
-    parser.add_argument('--skip-test', action='store_true', help='跳过连接测试')
-    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                       default='INFO', help='日志级别（默认INFO）')
-    parser.add_argument('--log-file', help='指定日志文件路径')
+    parser = argparse.ArgumentParser(description="STB谱面爬虫")
+    parser.add_argument(
+        "--days", type=int, default=7, help="爬取最近多少天的数据（默认7天）"
+    )
+    parser.add_argument("--modes", type=str, help="指定模式，逗号分隔（如0,1,2）")
+    parser.add_argument(
+        "--statuses", type=str, help="指定状态，逗号分隔（0=Alpha,1=Beta,2=Stable）"
+    )
+    parser.add_argument("--cid", type=str, help="爬取指定谱面ID，逗号分隔")
+    parser.add_argument("--sid", type=str, help="爬取指定歌曲ID的所有谱面，逗号分隔")
+    parser.add_argument("--once", action="store_true", help="运行一次后退出")
+    parser.add_argument("--test", action="store_true", help="只测试连接")
+    parser.add_argument("--test-api", action="store_true", help="测试API访问")
+    parser.add_argument(
+        "--no-api", action="store_true", help="不使用API搜索，使用其他数据源"
+    )
+    parser.add_argument(
+        "--source",
+        choices=["all", "home", "latest", "api", "newapi"],
+        default="all",
+        help="选择数据源: all=全部, home=主页, latest=最近变动, api=API搜索",
+    )
+    parser.add_argument(
+        "--max-charts", type=int, default=60, help="每个数据源最大爬取数量（默认60）"
+    )
+    parser.add_argument(
+        "--max-retries", type=int, default=3, help="每个数据源最大重试次数（默认3）"
+    )
+    parser.add_argument("--skip-test", action="store_true", help="跳过连接测试")
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="日志级别（默认INFO）",
+    )
+    parser.add_argument("--log-file", help="指定日志文件路径")
 
     # 新增的CID爬取参数
-    parser.add_argument('--cid-crawl', action='store_true', help='启动CID爬取模式')
-    parser.add_argument('--start-cid', type=int, default=1, help='起始CID（默认1）')
-    parser.add_argument('--end-cid', type=int, help='结束CID（默认无限制）')
-    parser.add_argument('--rpm', type=int, default=8, help='每分钟请求数（默认8）')
-    parser.add_argument('--no-resume', action='store_true', help='不从进度恢复，从头开始')
-    parser.add_argument('--progress-file', default='cid_progress.json', help='进度文件路径')
-    parser.add_argument('--status', action='store_true', help='显示当前爬取状态')
+    parser.add_argument("--cid-crawl", action="store_true", help="启动CID爬取模式")
+    parser.add_argument("--start-cid", type=int, default=1, help="起始CID（默认1）")
+    parser.add_argument("--end-cid", type=int, help="结束CID（默认无限制）")
+    parser.add_argument("--rpm", type=int, default=8, help="每分钟请求数（默认8）")
+    parser.add_argument(
+        "--no-resume", action="store_true", help="不从进度恢复，从头开始"
+    )
+    parser.add_argument(
+        "--progress-file", default="cid_progress.json", help="进度文件路径"
+    )
+    parser.add_argument("--status", action="store_true", help="显示当前爬取状态")
 
     # 新增的SID爬取参数
-    parser.add_argument('--sid-crawl', action='store_true', help='启动SID优先爬取')
-    parser.add_argument('--start-sid', type=int, default=1, help='起始SID（默认1）')
-    parser.add_argument('--end-sid', type=int, help='结束SID（默认无限制）')
-    parser.add_argument('--max-cids-per-song', type=int, default=999, help='每首歌曲最大CID数量（默认999）')
-    parser.add_argument('--no-skip-empty', action='store_true', help='不跳过空歌曲')
-    parser.add_argument('--sid-progress-file', default='sid_progress.json', help='SID进度文件路径')
-    parser.add_argument('--sid-status', action='store_true', help='显示SID爬取状态')
+    parser.add_argument("--sid-crawl", action="store_true", help="启动SID优先爬取")
+    parser.add_argument("--start-sid", type=int, default=1, help="起始SID（默认1）")
+    parser.add_argument("--end-sid", type=int, help="结束SID（默认无限制）")
+    parser.add_argument(
+        "--max-cids-per-song",
+        type=int,
+        default=999,
+        help="每首歌曲最大CID数量（默认999）",
+    )
+    parser.add_argument("--no-skip-empty", action="store_true", help="不跳过空歌曲")
+    parser.add_argument(
+        "--sid-progress-file", default="sid_progress.json", help="SID进度文件路径"
+    )
+    parser.add_argument("--sid-status", action="store_true", help="显示SID爬取状态")
 
     # 新增的向后SID爬取参数
-    parser.add_argument('--sid-backwards', action='store_true', help='启动向后SID爬取模式')
-    parser.add_argument('--start-sid-backwards', type=int, help='向后爬取的起始SID（默认从进度恢复或从1开始）')
-    parser.add_argument('--sid-backwards-rpm', type=int, default=10, help='向后SID爬取每分钟请求数（默认10）')
-    parser.add_argument('--sid-backwards-progress-file', default='sid_backwards_progress.json',
-                       help='向后SID进度文件路径')
-    parser.add_argument('--sid-backwards-status', action='store_true', help='显示向后SID爬取状态')
+    parser.add_argument(
+        "--sid-backwards", action="store_true", help="启动向后SID爬取模式"
+    )
+    parser.add_argument(
+        "--start-sid-backwards",
+        type=int,
+        help="向后爬取的起始SID（默认从进度恢复或从1开始）",
+    )
+    parser.add_argument(
+        "--sid-backwards-rpm",
+        type=int,
+        default=10,
+        help="向后SID爬取每分钟请求数（默认10）",
+    )
+    parser.add_argument(
+        "--sid-backwards-progress-file",
+        default="sid_backwards_progress.json",
+        help="向后SID进度文件路径",
+    )
+    parser.add_argument(
+        "--sid-backwards-status", action="store_true", help="显示向后SID爬取状态"
+    )
 
     # 新增的重试失败项目参数
-    parser.add_argument('--retry-failed', action='store_true', help='重新爬取所有失败的项目')
-    parser.add_argument('--skip-retry', action='store_true', help='CID/SID爬取时跳过失败项目重试')
-    parser.add_argument('--retry-rpm', type=int, default=5, help='重试时的每分钟请求数（默认5）')
-    parser.add_argument('--retry-max-retries', type=int, default=3, help='重试时的最大重试次数（默认3）')
-    parser.add_argument('--no-remove-successful', action='store_true',
-                       help='重试成功后不从失败列表中移除')
-    parser.add_argument('--progress-files', type=str,
-                       help='指定要处理的进度文件，逗号分隔（默认：cid_progress.json,sid_progress.json,sid_backwards_progress.json）')
+    parser.add_argument(
+        "--retry-failed", action="store_true", help="重新爬取所有失败的项目"
+    )
+    parser.add_argument(
+        "--skip-retry", action="store_true", help="CID/SID爬取时跳过失败项目重试"
+    )
+    parser.add_argument(
+        "--retry-rpm", type=int, default=5, help="重试时的每分钟请求数（默认5）"
+    )
+    parser.add_argument(
+        "--retry-max-retries", type=int, default=3, help="重试时的最大重试次数（默认3）"
+    )
+    parser.add_argument(
+        "--no-remove-successful",
+        action="store_true",
+        help="重试成功后不从失败列表中移除",
+    )
+    parser.add_argument(
+        "--progress-files",
+        type=str,
+        help="指定要处理的进度文件，逗号分隔（默认：cid_progress.json,sid_progress.json,sid_backwards_progress.json）",
+    )
 
     args = parser.parse_args()
 
@@ -3103,7 +3185,9 @@ def main():
 
     if args.sid_backwards_status:
         crawler = STBCrawler()
-        status = crawler.get_sid_backwards_progress_status(args.sid_backwards_progress_file)
+        status = crawler.get_sid_backwards_progress_status(
+            args.sid_backwards_progress_file
+        )
         print("向后SID爬取状态:")
         print(status)
         return
@@ -3113,6 +3197,13 @@ def main():
 
     # 创建爬虫实例
     crawler = STBCrawler()
+    crawler.mode_filter = (
+        [int(v) for v in args.modes.split(",")] if args.modes else None
+    )
+    crawler.status_filter = (
+        [int(v) for v in args.statuses.split(",")] if args.statuses else None
+    )
+    crawler.set_api_rate_limit(args.rpm)
 
     # 测试连接（除非跳过）
     if not args.skip_test:
@@ -3140,13 +3231,13 @@ def main():
         logger.info("启动重试失败项目模式")
         progress_files = None
         if args.progress_files:
-            progress_files = [f.strip() for f in args.progress_files.split(',')]
+            progress_files = [f.strip() for f in args.progress_files.split(",")]
 
         success, total = crawler.retry_failed_items(
             progress_files=progress_files,
             requests_per_minute=args.retry_rpm,
             max_retries=args.retry_max_retries,
-            remove_successful=not args.no_remove_successful
+            remove_successful=not args.no_remove_successful,
         )
         logger.info("重试失败项目完成: 成功 %d/%d", success, total)
         return
@@ -3158,7 +3249,7 @@ def main():
             start_sid=args.start_sid_backwards,
             max_requests_per_minute=args.sid_backwards_rpm,
             progress_file=args.sid_backwards_progress_file,
-            resume=not args.no_resume
+            resume=not args.no_resume,
         )
         logger.info("向后SID爬取完成: %d 首歌曲, %d 个谱面", songs, charts)
         return
@@ -3173,7 +3264,7 @@ def main():
             progress_file=args.sid_progress_file,
             resume=not args.no_resume,
             skip_empty_songs=not args.no_skip_empty,
-            max_cids_per_song=args.max_cids_per_song
+            max_cids_per_song=args.max_cids_per_song,
         )
         logger.info("SID爬取完成: %d 首歌曲, %d 个谱面", songs, charts)
         return
@@ -3187,14 +3278,14 @@ def main():
             requests_per_minute=args.rpm,
             progress_file=args.progress_file,
             resume=not args.no_resume,
-            skip_retry=args.skip_retry
+            skip_retry=args.skip_retry,
         )
         logger.info("CID爬取完成: 成功 %d 个谱面", success)
         return
 
     if args.cid:
         # 爬取指定谱面
-        cid_list = [int(cid.strip()) for cid in args.cid.split(',')]
+        cid_list = [int(cid.strip()) for cid in args.cid.split(",")]
         success_count = 0
         for cid in cid_list:
             if crawler.crawl_chart_detail_with_retry(cid):
@@ -3203,7 +3294,7 @@ def main():
 
     elif args.sid:
         # 爬取指定歌曲的所有谱面
-        sid_list = [int(sid.strip()) for sid in args.sid.split(',')]
+        sid_list = [int(sid.strip()) for sid in args.sid.split(",")]
         success_count = 0
         for sid in sid_list:
             song_cids = crawler.get_charts_from_song_page(sid)
@@ -3215,28 +3306,44 @@ def main():
 
     else:
         # 默认行为：依次尝试三种方式，带重试机制
-        if args.source == 'all':
+        if args.source == "all":
             # 使用所有数据源，带重试
             crawler.crawl_all_sources_with_retry(
                 max_charts_per_source=args.max_charts,
-                max_retries=args.max_retries
+                max_retries=args.max_retries,
+                modes=[int(v) for v in args.modes.split(",")] if args.modes else None,
+                statuses=(
+                    [int(v) for v in args.statuses.split(",")]
+                    if args.statuses
+                    else None
+                ),
             )
-        elif args.source == 'home':
+        elif args.source == "home":
             crawler.crawl_from_homepage(max_charts=args.max_charts)
-        elif args.source == 'latest':
+        elif args.source == "latest":
             crawler.crawl_from_latest_page(max_charts=args.max_charts)
-        elif args.source == 'api':
+        elif args.source == "api":
             modes = None
             if args.modes:
-                modes = [int(mode.strip()) for mode in args.modes.split(',')]
+                modes = [int(mode.strip()) for mode in args.modes.split(",")]
 
             statuses = None
             if args.statuses:
-                statuses = [int(status.strip()) for status in args.statuses.split(',')]
+                statuses = [int(status.strip()) for status in args.statuses.split(",")]
 
-            crawler.crawl_from_api_search(modes=modes, statuses=statuses, max_charts=args.max_charts)
-        elif args.source == 'newapi':
-            crawler.crawl_from_new_api(max_charts=args.max_charts)
+            crawler.crawl_from_api_search(
+                modes=modes, statuses=statuses, max_charts=args.max_charts
+            )
+        elif args.source == "newapi":
+            crawler.crawl_from_new_api(
+                max_charts=args.max_charts,
+                modes=[int(v) for v in args.modes.split(",")] if args.modes else None,
+                statuses=(
+                    [int(v) for v in args.statuses.split(",")]
+                    if args.statuses
+                    else None
+                ),
+            )
 
     # 更新爬取状态
     crawler.log_crawl_summary()
@@ -3245,4 +3352,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -457,7 +457,7 @@ async def get_chart_comments(
     cid: int,
     limit: int = Query(50, description="返回数量", ge=1, le=500),
     offset: int = Query(0, description="偏移量", ge=0),
-    include_recommend: bool = Query(True, description="是否包含推荐记录(type=1)")
+    include_recommend: bool = Query(True, description="是否包含推荐与不推荐投票记录")
 ):
     """获取谱面的评论/推荐流水"""
     try:

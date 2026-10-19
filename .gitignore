@@ -36,6 +36,7 @@ viz_output/*
 
 # 备份文件
 *.bak
+data/backups/
 
 # 压缩文件
 *.zip
@@ -56,6 +57,8 @@ mod_mapping.json   # 如果不需要跟踪可以保留，否则移除
 crawler_resume.bin
 data/config.yaml
 data/cookies.local.json
+data/mm_sync.lock
+data/recrawl/
 controller.log
 global_progress.bin
 

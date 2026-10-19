@@ -42,7 +42,7 @@ def install(cls, *, colorize, colors, get_separator, get_subseparator):
                 # 谱面相关命令（支持难度、时间、模式筛选）
                 ("stb_stats [模式]", "谱面基础统计"),
                 ("stb_summary [模式] [级别]", "谱面综合统计报告"),
-                ("stb_hot [模式] [排序] [数量]", "热门谱面排行榜"),
+                ("stb_hot [模式] [排序] [数量]", "热门谱面排行榜（推荐数排序: recommend_count）"),
                 ("stb_pie [模式] [类型]", "生成谱面分布饼状图"),
                 ("stb_recent [天数] [模式] [数量]", "查询最近更新的谱面"),
                 ("stb_quality [模式]", "检查数据质量"),

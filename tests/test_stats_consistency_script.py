@@ -1,4 +1,5 @@
 import sys
+import sqlite3
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
@@ -12,6 +13,24 @@ from malody_api.scripts import check_stats_api_consistency as consistency  # noq
 
 
 class TestStatsConsistencyScript(TestCase):
+    def test_stabilizer_ties_match_api_sort(self):
+        from malody_api.core.services.chart_service import ChartService
+
+        def connection():
+            conn=sqlite3.connect(':memory:')
+            conn.row_factory=sqlite3.Row
+            conn.execute('CREATE TABLE charts(stabled_by_name TEXT,status INTEGER,mode INTEGER,heat INTEGER,last_updated TEXT)')
+            conn.executemany('INSERT INTO charts VALUES(?,2,3,?,NULL)',[('Z',1),('B',10),('A',10)])
+            return conn
+
+        conn=connection()
+        try:baseline=consistency.calc_top_stabilizers_baseline(conn,3,20)
+        finally:conn.close()
+        with patch('malody_api.core.services.chart_service.get_db_connection',side_effect=connection):
+            actual=ChartService().get_top_stabilizers(3,20)
+        self.assertEqual([r['stabilizer_name'] for r in baseline],['A','B','Z'])
+        self.assertEqual([r['stabilizer_name'] for r in actual],[r['stabilizer_name'] for r in baseline])
+
     def test_parse_csv_ints(self):
         self.assertEqual(consistency.parse_csv_ints(""), [])
         self.assertEqual(consistency.parse_csv_ints("0, 1,2"), [0, 1, 2])

@@ -11,7 +11,7 @@
 $ErrorActionPreference = "Stop"
 
 Write-Host "== Gate 1/3: unit tests =="
-& $Python -m unittest discover -s tests -p "test_*.py" -v
+& $Python -m unittest discover -s tests -t . -p "test_*.py" -v
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "== Gate 2/3: compileall =="

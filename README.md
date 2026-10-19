@@ -56,7 +56,37 @@ python app/main.py   # 新入口
 
 服务将在 http://localhost:8000 启动，API 文档可在 http://localhost:8000/docs 查看。
 
+## CLI 谱面推荐数排行
+
+从本地数据库按 `charts.recommend_count` 降序查询（同推荐数按 CID 升序）：
+
+```bash
+python malody_stats.py stb_hot -1 recommend_count 20
+```
+
+`-1` 表示所有模式，可替换为 `0`（Key）、`3`（Catch）等模式编号；最后的 `20` 为返回数量。
+交互模式也可输入 `stb_hot -1 recommend_count 20`，支持现有选择器筛选，输出包含推荐数及已删除谱面标记。
+CLI 优先使用 `MALODY_DB_PATH`，默认读取 `data/malody_rankings.db`，兼容项目根目录下的旧数据库路径。
+
+新官网 API 不提供打赏数和独立游玩次数。采集器从谱面 HTML 补充打赏数，缺失字段保留已有值，
+新记录的未知值保存为 NULL。CLI 将未知值及旧版采集器的游玩数占位值显示为“未知”。
+修复推荐排行前 20 张谱面的计数（默认每两秒一次请求，写入前自动备份原值）：
+
+```bash
+python scripts/refresh_chart_metrics.py --limit 20          # 预览
+python scripts/refresh_chart_metrics.py --limit 20 --apply  # 保存
+python scripts/refresh_chart_metrics.py --cid 17302 --apply # 指定 CID
+```
+
+该修复只更新官网明确给出的热度和打赏数，并将这些谱面未采集的游玩数占位 0 改为 NULL。
+热度（Hot）不作为独立游玩次数。其余谱面的历史计数需要后续重新采集。
+
 ## API 文档
+
+谱面详情 `GET /charts/{cid}` 包含 `not_recommend_count`（官方 `dislike`，未采集时为 `null`）。
+评论明细包含 `is_recommend` 和 `is_not_recommend`；旧站 `type=1` 同时用于正、负投票，因此按去除 HTML 后的明确投票前缀区分方向。不推荐事件不计入普通评论数量，历史事件数量也不作为当前不推荐总数。
+
+旧库可运行 `python scripts/backfill_not_recommend.py --apply` 增加字段并回填明确的历史投票分类；可加 `--cids 17302 8438` 按官方接口补齐指定谱面的当前不推荐数。写入前会在 `logs/not_recommend_backups/` 保存旧值。其余谱面的总数由后续爬虫采集补齐，已有汇总推荐数仍需按来源另行核正。
 
 ### 主要端点
 
@@ -315,6 +345,9 @@ DoD and gate details:
 - `docs/DELIVERY_GATES.md`
 
 ## External Data Source Troubleshooting
+
+Crawler repair details: [implementation and validation](docs/CRAWLER_REPAIR_IMPLEMENTATION_2026-10-18.md).
+Full recrawls require an explicit human start; see the [manual recrawl guide](docs/MANUAL_RECRAWL.md) for isolated batches, progress, reports and guarded publication.
 
 Quick checks:
 1. `GET /crawler/status` and inspect `data_source_health`.
